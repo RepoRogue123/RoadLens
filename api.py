@@ -21,6 +21,7 @@ from inference import (
 )
 from features import extract_depth_features
 from classifier import classify_severity
+import semantic_config
 
 # Optional imports for new modules (graceful degradation)
 try:
@@ -31,9 +32,24 @@ except ImportError:
 
 try:
     from water_detection import detect_water as _detect_water
+    import water_config
     _HAS_WATER_DETECTION = True
 except ImportError:
     _HAS_WATER_DETECTION = False
+
+# Cue 7 — CLIPSeg open-vocabulary water prior. Optional, gated off by default.
+try:
+    import semantic_water
+    _HAS_SEMANTIC_WATER = semantic_water.HAS_CLIPSEG
+except Exception:
+    _HAS_SEMANTIC_WATER = False
+
+# Cue 8 — intrinsic-decomposition specular residual. Optional, gated off.
+try:
+    import intrinsic_cues
+    _HAS_INTRINSIC = intrinsic_cues.HAS_INTRINSIC
+except Exception:
+    _HAS_INTRINSIC = False
 
 try:
     from temporal_analysis import estimate_pothole_age, predict_severity_progression
@@ -567,6 +583,82 @@ def _safe_results_file(file_name: str) -> Path:
     return target
 
 
+def _water_cue_status(first: Dict) -> Dict[str, str]:
+    """
+    Per-cue state for the water ensemble.
+
+    Six cues always run; two are optional and default off. Reporting which of
+    the eight actually voted keeps an absent witness distinguishable from one
+    that voted against — the same discipline the module status strip applies at
+    phase level.
+    """
+    wa = first.get("waterAnalysis") or {}
+
+    def optional(enabled: bool, importable: bool, score_present: bool) -> str:
+        if not importable:
+            return "unavailable"
+        if not enabled:
+            return "disabled"
+        return "ran" if score_present else "abstained"
+
+    return {
+        "base": "ran" if wa else "not run",
+        "semantic": optional(
+            bool(_HAS_WATER_DETECTION and water_config.ENABLE_SEMANTIC_CUE),
+            _HAS_SEMANTIC_WATER,
+            wa.get("semanticScore") is not None,
+        ),
+        "residual": optional(
+            bool(_HAS_WATER_DETECTION and water_config.ENABLE_RESIDUAL_CUE),
+            _HAS_INTRINSIC,
+            wa.get("residualScore") is not None,
+        ),
+    }
+
+
+def _module_status(potholes: List[Dict]) -> Dict[str, Dict]:
+    """
+    Report which analysis witnesses actually ran.
+
+    Every optional module is behind an import gate and a broad exception
+    handler, so a missing dependency previously disabled a whole phase with no
+    warning while the response still looked complete. A confident answer with a
+    silently absent witness is worse than a visibly degraded one, so the state
+    is now reported explicitly and surfaced in the UI.
+    """
+    first = potholes[0] if potholes else {}
+    geo = first.get("geometryAnalysis", {}) or {}
+    has_dinov2 = bool(geo.get("foundationFeatures"))
+
+    return {
+        "geometry": {
+            "available": bool(_HAS_GEOMETRY),
+            "ran": bool(geo.get("curvatureFeatures")),
+            "detail": "curvature, road-relative bowl depth, surface normals",
+        },
+        "semantic": {
+            "available": bool(_HAS_GEOMETRY) and has_dinov2,
+            "ran": has_dinov2,
+            "calibrated": semantic_config.IS_CALIBRATED,
+            "verdict": first.get("semanticVerdict"),
+            "detail": semantic_config.describe(),
+        },
+        "water": {
+            "available": bool(_HAS_WATER_DETECTION),
+            "ran": first.get("waterAnalysis") is not None,
+            "calibrated": water_config.IS_CALIBRATED if _HAS_WATER_DETECTION else False,
+            "cues": _water_cue_status(first),
+            "detail": (water_config.describe() if _HAS_WATER_DETECTION
+                       else "water detection unavailable"),
+        },
+        "temporal": {
+            "available": bool(_HAS_TEMPORAL),
+            "ran": first.get("temporalAnalysis") is not None,
+            "detail": "age estimation and 30/60/90-day progression",
+        },
+    }
+
+
 @app.get("/healthz")
 async def healthz():
     return {"success": True, "status": "ok"}
@@ -711,6 +803,28 @@ async def analyze_image(file: UploadFile = File(...)):
                 interpolation=cv2.INTER_LINEAR,
             )
 
+        # ── 2b. Image-level water cue inputs ──
+        # Computed once per IMAGE, never per pothole: both are full forward
+        # passes, and a frame with seven potholes would otherwise pay for them
+        # seven times. Both gated off by default — see water_config.
+        water_prior = None
+        residual_map = None
+        if _HAS_WATER_DETECTION:
+            if _HAS_SEMANTIC_WATER and water_config.ENABLE_SEMANTIC_CUE:
+                try:
+                    water_prior = semantic_water.water_prior_map(
+                        cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                    )
+                except Exception:
+                    water_prior = None
+            if _HAS_INTRINSIC and water_config.ENABLE_RESIDUAL_CUE:
+                try:
+                    residual_map = intrinsic_cues.residual_energy_map(
+                        cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                    )
+                except Exception:
+                    residual_map = None
+
         # ── 3. Load ML artifacts once ──
         scaler = None
         ml_models = {}
@@ -790,21 +904,52 @@ async def analyze_image(file: UploadFile = File(...)):
                         # Extract DINOv2 foundation features specifically into a sub-object
                         dinov2_features = {k: v for k, v in geo_feats.items() if k.startswith("dinov2")}
                         if dinov2_features:
+                            ratio = dinov2_features.get(semantic_config.RATIO_KEY)
+                            n_patches = int(dinov2_features.get("dinov2_patch_count", 0))
+
                             pothole["geometryAnalysis"]["foundationFeatures"] = {
                                 "dissimilarity": round(dinov2_features.get("dinov2_dissimilarity", 0), 4),
                                 "insideVariance": round(dinov2_features.get("dinov2_inside_variance", 0), 4),
                                 "outsideVariance": round(dinov2_features.get("dinov2_outside_variance", 0), 4),
+                                # Corrected, ring-local, size-matched comparison (A1)
+                                "ringVariance": round(dinov2_features.get("dinov2_ring_variance", 0), 4),
+                                "varianceRatio": round(ratio, 4) if ratio is not None else None,
+                                "patchCount": n_patches,
+                                "calibrated": semantic_config.IS_CALIBRATED,
                             }
-                            
-                            # ── Texture Illusion Override ──
-                            # If model predicts "Deep" but the texture inside is smoother than the road outside,
-                            # it is likely a texture-based depth illusion (shallow depression).
-                            if consensus == "Deep" or rule_severity == "Deep":
-                                inside_var = dinov2_features.get("dinov2_inside_variance", 0)
-                                outside_var = dinov2_features.get("dinov2_outside_variance", 0)
-                                if 0 < inside_var < (outside_var * 0.9):  
+
+                            # ── Semantic Verification Override ──
+                            # A real crater is materially heterogeneous (rubble, cracks,
+                            # internal shadow); a flat illusion is smoother than the road
+                            # around it. The ratio compares interior against a local ring
+                            # of road patches, sampled to the same patch count.
+                            #
+                            # Two-way: strong smoothness downgrades an over-reported
+                            # verdict; strong heterogeneity raises an under-reported one
+                            # (the Phase 1 "dry, shadowless flattening" failure mode,
+                            # which the old one-way rule structurally could not act on).
+                            #
+                            # Abstains when the interior covers too few patches for the
+                            # variance to mean anything.
+                            if ratio is None or ratio != ratio:  # missing or NaN
+                                pothole["semanticVerdict"] = "unavailable"
+                            elif n_patches < semantic_config.MIN_PATCHES:
+                                pothole["semanticVerdict"] = "abstained_sparse_patches"
+                            elif ratio < semantic_config.DOWNGRADE_RATIO:
+                                if consensus == "Deep" or rule_severity == "Deep":
                                     pothole["consensusSeverity"] = "Shallow"
                                     pothole["illusionWarning"] = True
+                                    pothole["semanticVerdict"] = "downgraded_texture_illusion"
+                                else:
+                                    pothole["semanticVerdict"] = "smooth_interior_no_action"
+                            elif ratio > semantic_config.UPGRADE_RATIO:
+                                if normalize_severity(consensus) == "Shallow":
+                                    pothole["consensusSeverity"] = "Moderate"
+                                    pothole["semanticVerdict"] = "raised_heterogeneous_interior"
+                                else:
+                                    pothole["semanticVerdict"] = "heterogeneous_interior_confirms"
+                            else:
+                                pothole["semanticVerdict"] = "inconclusive"
                 except Exception:
                     pass  # graceful degradation
 
@@ -817,6 +962,8 @@ async def analyze_image(file: UploadFile = File(...)):
                         image_rgb, mask,
                         depth_map=depth_map,
                         curvature_features=curv_feats,
+                        water_prior_map=water_prior,
+                        residual_map=residual_map,
                     )
                     if water_result is not None:
                         pothole["waterAnalysis"] = {
@@ -824,6 +971,10 @@ async def analyze_image(file: UploadFile = File(...)):
                             "waterProbability": water_result.get('water_probability', 0.0),
                             "confidenceLevel": water_result.get('confidence_level', 'low'),
                             "inconsistencyScore": water_result.get('inconsistency_score'),
+                            "semanticScore": water_result.get('semantic_score'),
+                            "residualScore": water_result.get('residual_score'),
+                            "cueWeights": water_result.get('cue_weights'),
+                            "correctionsApplied": water_result.get('corrections_applied'),
                         }
                 except Exception:
                     pass  # graceful degradation
@@ -971,6 +1122,7 @@ async def analyze_image(file: UploadFile = File(...)):
                 "totalClassifiers": total_classifiers,
                 "features": features,
                 "classifications": classifications,
+                "moduleStatus": _module_status(potholes),
                 "potholes": potholes,
                 "images": {
                     "original": img_original,

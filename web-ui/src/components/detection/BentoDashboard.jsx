@@ -6,6 +6,7 @@ import FeatureStrip from '../FeatureStrip';
 import ClassifierTable from '../ClassifierTable';
 import { NAME_TO_ID } from '../../theme/classifiers';
 import InstrumentPanel from '../instrument/InstrumentPanel';
+import ModuleStatusStrip from '../instrument/ModuleStatusStrip';
 import InteractiveViewport from './InteractiveViewport';
 import HologramTerrain from '../holo/HologramTerrain';
 import DepthProfileChart from './DepthProfileChart';
@@ -51,6 +52,13 @@ export default function BentoDashboard({ results }) {
 
   return (
     <Motion.div variants={panelCascade} initial="hidden" animate="show" className="space-y-6">
+      {/* 0. Which witnesses actually ran */}
+      {results.moduleStatus && (
+        <Motion.div variants={panelEnter}>
+          <ModuleStatusStrip moduleStatus={results.moduleStatus} />
+        </Motion.div>
+      )}
+
       {/* 1. Priority alert */}
       <Motion.div variants={panelEnter}>
         <WaterHazardAlert waterAnalysis={primaryPothole.waterAnalysis} />

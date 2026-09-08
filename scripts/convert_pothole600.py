@@ -17,13 +17,28 @@ REPORT_CSV = STATS_DIR / "dataset_report.csv"
 SEVERITY_DIR = MERGED_DIR / "severity_labels"
 STEREO_DIR = MERGED_DIR / "stereo"
 
+# ── Stereo calibration status ────────────────────────────────────────────
+# Pothole-600 ships RGB + transformed-disparity + segmentation labels, but no
+# camera calibration file. Without the true focal length and stereo baseline
+# the disparity->depth conversion cannot produce metric units.
+#
+# Set CALIBRATION_AVAILABLE = True and fill in the real values to obtain metric
+# depth; until then the output is relative (inverse disparity, arbitrary scale)
+# and the output directory is named accordingly so nothing downstream mistakes
+# it for a measurement in metres.
+CALIBRATION_AVAILABLE = False
+FOCAL_LENGTH_PX = 1.0    # placeholder — real value required for metric output
+BASELINE_M = 1.0         # placeholder — real value required for metric output
+
+RELATIVE_DEPTH_DIRNAME = "metric_depth" if CALIBRATION_AVAILABLE else "relative_depth"
+
 # Sub-directories setup
 SEVERITY_DIR.mkdir(parents=True, exist_ok=True)
 for split in ["train", "valid", "test"]:
     (MERGED_DIR / split / "images").mkdir(parents=True, exist_ok=True)
     (MERGED_DIR / split / "labels").mkdir(parents=True, exist_ok=True)
     (STEREO_DIR / "disparity" / split).mkdir(parents=True, exist_ok=True)
-    (STEREO_DIR / "metric_depth" / split).mkdir(parents=True, exist_ok=True)
+    (STEREO_DIR / RELATIVE_DEPTH_DIRNAME / split).mkdir(parents=True, exist_ok=True)
 
 
 def append_to_csv(rows):
@@ -74,16 +89,26 @@ def process_masks_to_yolo(mask_path, w, h):
     return polygons
 
 def process_disparity(disp_path, dest_disp_path, dest_depth_path, focal_length, baseline):
+    """
+    Convert a Pothole-600 disparity map into a depth map.
+
+    IMPORTANT — the output is only metric when `focal_length` and `baseline`
+    are the real calibration values of the capture rig. Pothole-600 ships no
+    calibration file (see CALIBRATION_AVAILABLE below), so with the placeholder
+    values of 1.0 this returns *inverse disparity in arbitrary units*, which is
+    proportional to depth but carries no scale. It is usable as a relative
+    depth reference; it must not be quoted in centimetres or metres.
+    """
     disp = cv2.imread(str(disp_path), cv2.IMREAD_UNCHANGED)
     if disp is None:
         return False
-    
+
     disp_float = disp.astype(np.float32)
-    # Avoid div by zero
-    depth_meters = (focal_length * baseline) / (disp_float + 1e-8)
-    
+    # Z = f * B / d   — metric only if f and B are the true rig parameters.
+    depth = (focal_length * baseline) / (disp_float + 1e-8)
+
     np.save(str(dest_disp_path), disp_float)
-    np.save(str(dest_depth_path), depth_meters)
+    np.save(str(dest_depth_path), depth)
     return True
 
 def convert_pothole600():
@@ -143,8 +168,17 @@ def convert_pothole600():
     # 3. Process images
     labeled_valid = []
     unlabeled_valid = []
-    focal_length = 1.0 # placeholder, usually found in readme
-    baseline = 1.0 # placeholder
+    focal_length = FOCAL_LENGTH_PX
+    baseline = BASELINE_M
+    if not CALIBRATION_AVAILABLE:
+        print("  " + "!" * 68)
+        print("  !  NO STEREO CALIBRATION AVAILABLE for Pothole-600.")
+        print("  !  Disparity is being converted with placeholder f=B=1.0, so the")
+        print("  !  output is INVERSE DISPARITY IN ARBITRARY UNITS, not metres.")
+        print(f"  !  Writing to stereo/{RELATIVE_DEPTH_DIRNAME}/ (not 'metric_depth').")
+        print("  !  Do not quote these values in cm/m. To make them metric, set")
+        print("  !  CALIBRATION_AVAILABLE=True with the real focal length/baseline.")
+        print("  " + "!" * 68)
     
     # try to parse readme for focal_length and baseline
     readme_files = list(p600_dir.rglob("*readme*")) + list(p600_dir.rglob("*.txt"))
@@ -234,7 +268,7 @@ def convert_pothole600():
                     
             if info["has_disp"]:
                 disp_dest = STEREO_DIR / "disparity" / split / f"{new_stem}.npy"
-                depth_dest = STEREO_DIR / "metric_depth" / split / f"{new_stem}.npy"
+                depth_dest = STEREO_DIR / RELATIVE_DEPTH_DIRNAME / split / f"{new_stem}.npy"
                 process_disparity(info["disp_path"], disp_dest, depth_dest, focal_length, baseline)
                 
             has_label = len(info["polygons"]) > 0

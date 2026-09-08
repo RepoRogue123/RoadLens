@@ -254,6 +254,36 @@ def extract_features_extended(mask, depth_map):
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ── Curvature smoothing window ───────────────────────────────────────────
+# "fractional" scales the Savitzky-Golay window with contour length so the
+# measurement scale is the same for a small pothole and a large one.
+# "constant" restores the original min(n-1, 31) behaviour, kept so the two can
+# be compared directly rather than assumed equivalent.
+CURVATURE_WINDOW_MODE = "fractional"
+
+# Fraction of the contour used as the smoothing window. 0.08 keeps roughly the
+# same absolute window as the old constant at n≈390 (the middle of our observed
+# range), so typical potholes are treated about as before while small and large
+# ones stop being treated differently from each other.
+CURVATURE_WINDOW_FRACTION = 0.08
+CURVATURE_WINDOW_MIN = 5
+CURVATURE_WINDOW_MAX = 51
+
+
+def _curvature_window(n_points: int) -> int:
+    """Odd Savitzky-Golay window length for a contour of `n_points`."""
+    if CURVATURE_WINDOW_MODE == "constant":
+        win = min(n_points - 1, 31)
+    else:
+        win = int(round(n_points * CURVATURE_WINDOW_FRACTION))
+        win = min(win, n_points - 1, CURVATURE_WINDOW_MAX)
+
+    if win % 2 == 0:
+        win -= 1
+    # polyorder is 3, so the window must exceed it.
+    return max(win, CURVATURE_WINDOW_MIN)
+
+
 def extract_curvature_features(mask: np.ndarray) -> Optional[Dict[str, Any]]:
     """
     Extract curvature-based features from the pothole mask boundary contour.
@@ -290,12 +320,21 @@ def extract_curvature_features(mask: np.ndarray) -> Optional[Dict[str, Any]]:
     x = contour_pts[:, 0].astype(np.float64)
     y = contour_pts[:, 1].astype(np.float64)
 
-    # Smooth contour coordinates to reduce pixel-level noise while preserving shape
-    # Window length must be odd and <= number of points
-    win_len = min(len(x) - 1, 31)
-    if win_len % 2 == 0:
-        win_len -= 1
-    win_len = max(win_len, 5)
+    # Smooth contour coordinates to reduce pixel-level noise while preserving shape.
+    #
+    # The window MUST scale with contour length. The original code used a
+    # constant `min(len(x) - 1, 31)`, which smooths a 40-point contour almost
+    # out of existence (window covers ~78% of it) while barely touching an
+    # 800-point one (~4%). Curvature is a second derivative, so the effective
+    # measurement scale differs wildly between small and large potholes and
+    # `max_curvature` is not comparable across them.
+    #
+    # That defect was not theoretical. Measured against real RealSense depth,
+    # mean_curvature correlated -0.254 with true depth — but controlling for
+    # area collapsed it to -0.041. The apparent signal was the window artefact:
+    # bigger potholes are deeper AND less smoothed, so curvature fell as depth
+    # rose. A fraction of contour length removes that confound.
+    win_len = _curvature_window(len(x))
 
     x_smooth = scipy.signal.savgol_filter(x, window_length=win_len, polyorder=3, mode='wrap')
     y_smooth = scipy.signal.savgol_filter(y, window_length=win_len, polyorder=3, mode='wrap')

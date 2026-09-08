@@ -29,6 +29,8 @@ from typing import Any, Dict, Optional
 import cv2
 import numpy as np
 
+import water_config
+
 
 def _get_road_surround_mask(image_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
@@ -336,11 +338,104 @@ def _depth_appearance_inconsistency_score(
     return float(np.clip(inconsistency, 0.0, 1.0))
 
 
+def _semantic_prior_score(water_prior: np.ndarray, mask: np.ndarray,
+                          surround_mask: np.ndarray) -> float:
+    """
+    Cue 7: Open-vocabulary semantic prior (CLIPSeg).
+
+    Cues 1-6 all respond to CONTRAST, and a hard shadow on dry asphalt produces
+    contrast. That shared blind spot is why this module needed hand-tuned
+    penalties to stop firing on pic-65 (dry gravel in sunlight). CLIPSeg answers
+    a different question — does this region READ as water — so its errors are
+    not correlated with theirs, which is the entire reason to add it.
+
+    `water_prior` is already a softmax contrast between water prompts and dry
+    prompts (see semantic_water.py), so 0.5 means "no evidence either way"
+    rather than "slightly wet".
+
+    Returns score in [0, 1] where high = reads as water.
+    """
+    inside = water_prior[mask > 0]
+    if inside.size < 10:
+        return 0.0
+
+    mean_inside = float(np.mean(inside))
+
+    # Absolute: the prior taken at face value.
+    abs_score = float(np.clip(mean_inside, 0.0, 1.0))
+
+    # Relative: is the interior more water-like than the road around it?
+    # Centred on 0.5 so parity between the two contributes nothing either way.
+    # This keeps the cue alive on a uniformly wet scene, where the relative
+    # term is uninformative but the absolute one is not.
+    surr = water_prior[surround_mask > 0]
+    if surr.size > 10:
+        delta = mean_inside - float(np.mean(surr))
+        rel_score = float(np.clip(0.5 + delta, 0.0, 1.0))
+    else:
+        rel_score = abs_score
+
+    return 0.5 * abs_score + 0.5 * rel_score
+
+
+def _specular_residual_score(residual_map: np.ndarray, mask: np.ndarray,
+                             surround_mask: np.ndarray) -> float:
+    """
+    Cue 8: Non-diffuse residual energy (intrinsic decomposition).
+
+    Fresnel reflectance rises steeply toward grazing incidence:
+
+        R(theta) = R0 + (1 - R0) * (1 - cos theta)^5,   R0 ~ 0.02 for water
+
+    Road photography looks ALONG the surface, so theta is typically 80-88
+    degrees and R lands between roughly 0.40 and 0.84 — most of the radiance
+    from a puddle is reflected, not diffuse. Intrinsic decomposition isolates
+    that non-diffuse term in its residual channel, which turns the Fresnel
+    argument from rhetoric into a measurement.
+
+    Relative only, deliberately. The residual carries no absolute calibration —
+    its scale depends on exposure and on the decomposition — so an absolute
+    threshold would not transfer between images.
+
+    IMPORTANT — measured, not assumed. Over 13 real regions the positive-residual
+    interior/ring ratio ran min 0.193, median 0.712, max 1.181, with only 23%
+    above 1.0. Potholes are recessed and shadowed, so they receive LESS direct
+    light than the sunlit road around them and are therefore less specular in
+    general. An earlier 1.0 -> 2.5 mapping clipped 77% of regions to exactly
+    zero, and since the cue carries weight in the ensemble that made it a
+    constant dilutant: the one image labelled wet dropped from 0.234 to 0.210
+    when the cue was switched on.
+
+    The range below is taken from that observed distribution. It is a scale
+    derived from data, not a fitted decision boundary — the boundary is what
+    scripts/eval_water_puddle1000.py exists to establish.
+
+    Returns score in [0, 1] where high = strongly non-diffuse (water-like).
+    """
+    inside = residual_map[mask > 0]
+    surr = residual_map[surround_mask > 0]
+    if inside.size < 10 or surr.size < 10:
+        return 0.0
+
+    mean_surr = float(np.mean(surr))
+    if mean_surr <= 1e-6:
+        return 0.0
+
+    ratio = float(np.mean(inside)) / mean_surr
+
+    lo = water_config.RESIDUAL_RATIO_LOW
+    hi = water_config.RESIDUAL_RATIO_HIGH
+    score = (ratio - lo) / max(hi - lo, 1e-8)
+    return float(np.clip(score, 0.0, 1.0))
+
+
 def detect_water(
     image_rgb: np.ndarray,
     mask: np.ndarray,
     depth_map: np.ndarray = None,
     curvature_features: Dict[str, Any] = None,
+    water_prior_map: Optional[np.ndarray] = None,
+    residual_map: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Detect water inside a pothole using a 6-cue edge-aware ensemble.
@@ -356,11 +451,20 @@ def detect_water(
     Args:
         image_rgb: Original image in RGB format (HxWx3, uint8).
         mask: Binary pothole mask (HxW, uint8, values {0, 1}).
-        depth_map: Depth map (HxW, float). Optional.
-        curvature_features: Dict from extract_curvature_features(). Optional.
+        depth_map: Depth map (HxW, float). Optional — enables cue 6.
+        curvature_features: Dict from extract_curvature_features(). Optional —
+            required alongside depth_map for cue 6.
+        water_prior_map: HxW float in [0, 1] from semantic_water.water_prior_map().
+            Optional — enables cue 7. Computed once per IMAGE by the caller, not
+            once per pothole, so the ViT forward pass is paid once regardless of
+            how many regions were segmented.
+        residual_map: HxW float from intrinsic_cues.residual_energy_map().
+            Optional — enables cue 8. Same once-per-image contract.
 
     Returns:
-        Dictionary with detection results and per-cue breakdown.
+        Dictionary with detection results and per-cue breakdown. Cues whose
+        input was not supplied report None rather than 0.0, so an absent witness
+        is distinguishable from one that voted against.
     """
     if mask is None or np.sum(mask) == 0:
         return {
@@ -369,7 +473,8 @@ def detect_water(
             'edge_density_score': 0.0, 'gradient_score': 0.0,
             'specular_score': 0.0, 'color_score': 0.0,
             'saturation_score': 0.0, 'inconsistency_score': None,
-            'cue_weights': {},
+            'semantic_score': None, 'residual_score': None,
+            'cue_weights': {}, 'corrections_applied': False,
         }
 
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
@@ -391,15 +496,20 @@ def detect_water(
             curvature_features, depth_map, mask
         )
 
+    semantic_score = None
+    if water_prior_map is not None:
+        semantic_score = _semantic_prior_score(water_prior_map, mask, surround_mask)
+
+    residual_score = None
+    if residual_map is not None:
+        residual_score = _specular_residual_score(residual_map, mask, surround_mask)
+
     # ── Weighted ensemble ──
-    # Edge density and gradient are the most physically-grounded cues
-    weights = {
-        'edge_density': 0.25,    # Strongest discriminator (3% vs 35%)
-        'gradient': 0.20,        # Second strongest (25 vs 197)
-        'specular': 0.15,        # Spatially-aware specular
-        'color': 0.15,           # Blue ratio + brightness
-        'saturation': 0.10,      # Low saturation check
-    }
+    # Weights now live in water_config so they can be overridden by a fit
+    # against a labelled set. The defaults are the original hand-set values, so
+    # behaviour with only the base cues available is unchanged.
+    W = water_config.CUE_WEIGHTS
+    weights = {k: W[k] for k in water_config.BASE_CUES}
     scores = {
         'edge_density': edge_score,
         'gradient': gradient_score,
@@ -408,47 +518,72 @@ def detect_water(
         'saturation': saturation_score,
     }
 
-    if inconsistency_score is not None:
-        weights['inconsistency'] = 0.15
-        scores['inconsistency'] = inconsistency_score
-        # Re-normalize
-        base_sum = sum(v for k, v in weights.items() if k != 'inconsistency')
-        for key in list(weights.keys()):
-            if key != 'inconsistency':
-                weights[key] *= (0.85 / base_sum)
+    # Optional cues join the ensemble only when their input was supplied. The
+    # division by total_weight below renormalises over whatever is present, so
+    # an absent cue abstains rather than voting zero.
+    for name, value in (
+        ('inconsistency', inconsistency_score),
+        ('semantic', semantic_score),
+        ('residual', residual_score),
+    ):
+        if value is not None:
+            weights[name] = W[name]
+            scores[name] = value
 
-    # Linear combination
-    total_weight = sum(weights.values())
-    water_prob = sum(weights[k] * scores[k] for k in weights) / max(total_weight, 1e-8)
+    if water_config.USE_LOGISTIC:
+        # Signed combination. Admits cues that argue AGAINST water, which the
+        # normalised sum below cannot express — see water_config.USE_LOGISTIC.
+        # Only cues present in BOTH the fitted coefficients and this call
+        # contribute, so an absent optional cue abstains rather than being
+        # treated as zero evidence.
+        z = water_config.LOGISTIC_INTERCEPT
+        for k, s in scores.items():
+            c = water_config.LOGISTIC_COEF.get(k)
+            if c is not None:
+                z += c * s
+        water_prob = 1.0 / (1.0 + float(np.exp(-np.clip(z, -30.0, 30.0))))
+    else:
+        total_weight = sum(weights.values())
+        water_prob = (sum(weights[k] * scores[k] for k in weights)
+                      / max(total_weight, 1e-8))
 
     # ── Non-linear corrections ──
-    # Boost: if edge density AND gradient both say water (both > 0.6), boost
-    if edge_score > 0.6 and gradient_score > 0.6:
-        water_prob = water_prob * 0.65 + 0.35
+    # These are the most overfitted part of the module — each was introduced to
+    # fix one named image, and the constants are recorded in water_config so the
+    # evaluation harness can disable them wholesale and measure how much of the
+    # behaviour they account for.
+    C = water_config.CORRECTIONS
+    corrections_applied = bool(water_config.APPLY_CORRECTIONS)
 
-    # Penalty: if edge density is very low (rough surface), hard cap probability
-    # This is the key fix for pic-65: gravel has edge_score ≈ 0.0
-    if edge_score < 0.15:
-        # Very rough surface — almost certainly not water
-        water_prob = min(water_prob, 0.25)
-    elif edge_score < 0.30:
-        # Moderately rough — cap at moderate probability
-        water_prob = min(water_prob, 0.40)
+    if corrections_applied:
+        # Boost: the two strongest cues agreeing compresses toward the high end.
+        if (edge_score > C['agreement_boost_threshold']
+                and gradient_score > C['agreement_boost_threshold']):
+            water_prob = (water_prob * C['agreement_boost_scale']
+                          + C['agreement_boost_offset'])
 
-    # Penalty: if gradient is very high inside (rough texture), reduce
-    if gradient_score < 0.15:
-        water_prob *= 0.6
+        # Penalty: a rough interior hard-caps the probability. Introduced for
+        # pic-65, where dry gravel in sunlight scored 47.1%.
+        if edge_score < C['rough_cap_hard_edge']:
+            water_prob = min(water_prob, C['rough_cap_hard_value'])
+        elif edge_score < C['rough_cap_soft_edge']:
+            water_prob = min(water_prob, C['rough_cap_soft_value'])
+
+        # Penalty: high interior gradient scales the result down.
+        if gradient_score < C['gradient_penalty_edge']:
+            water_prob *= C['gradient_penalty_scale']
 
     water_prob = float(np.clip(water_prob, 0.0, 1.0))
 
     # ── Decision ──
-    is_water = water_prob > 0.35
+    bands = water_config.CONFIDENCE_BANDS
+    is_water = water_prob > water_config.DECISION_THRESHOLD
 
-    if water_prob > 0.65:
+    if water_prob > bands['high']:
         confidence_level = 'high'
-    elif water_prob > 0.45:
+    elif water_prob > bands['medium']:
         confidence_level = 'medium'
-    elif water_prob > 0.35:
+    elif water_prob > bands['low']:
         confidence_level = 'low'
     else:
         confidence_level = 'none'
@@ -463,5 +598,8 @@ def detect_water(
         'color_score': round(color_score, 4),
         'saturation_score': round(saturation_score, 4),
         'inconsistency_score': round(inconsistency_score, 4) if inconsistency_score is not None else None,
+        'semantic_score': round(semantic_score, 4) if semantic_score is not None else None,
+        'residual_score': round(residual_score, 4) if residual_score is not None else None,
         'cue_weights': {k: round(v, 3) for k, v in weights.items()},
+        'corrections_applied': corrections_applied,
     }

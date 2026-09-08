@@ -34,6 +34,29 @@ USE_MERGED_DATASET    = True   # False = use original data1/ only
 USE_EXTENDED_FEATURES = True   # False = use original 11 features
 USE_REAL_LABELS       = True   # False = KMeans pseudo-labels only
 USE_ADVERSE_AUGMENTATION = False # True = Synthetically augment training data with weather/lighting
+USE_GEOMETRY_FEATURES = True   # False = depth statistics only (the pre-Phase-1 baseline)
+
+# Phase 1 depth-independent geometry, produced by
+# features.extract_all_geometry_features(). Curvature is computed from the 2D
+# mask alone; the bowl-depth and surface-normal groups use depth only as a
+# difference against the surrounding road. All three groups zero-fill on
+# failure, so the column set is stable.
+#
+# DINOv2 features are deliberately excluded: extract_all_geometry_features is
+# called here without image_rgb, and running a ViT forward pass over every
+# pothole row would dominate training time. They remain an API-layer signal.
+GEOMETRY_FEATURE_COLS = [
+    # curvature (mask only — no depth read at all)
+    'max_curvature', 'mean_curvature', 'std_curvature', 'p90_curvature',
+    'high_curvature_fraction', 'curvature_entropy', 'concave_fraction',
+    'curvature_sign_changes', 'contour_length', 'contour_elongation',
+    # road-relative bowl depth
+    'mean_bowl_depth', 'max_bowl_depth', 'std_bowl_depth',
+    'mean_road_curvature', 'slope_variance',
+    # surface-normal deviation at the boundary ring
+    'mean_normal_deviation', 'max_normal_deviation',
+    'std_normal_deviation', 'p90_normal_deviation',
+]
 
 if USE_MERGED_DATASET:
     IMAGES_TRAIN = "merged_dataset/train/images"
@@ -459,6 +482,13 @@ def main():
             'depth_kurtosis', 'boundary_gradient', 'weighted_mean_depth',
             'surface_area_px2', 'surface_area_cm2'
         ]
+        # ── Phase 1 geometry features ────────────────────────────────────
+        # These are extracted by extract_all_geometry_features() during
+        # feature building, but until now were never selected for training —
+        # so every model shipped was trained on depth statistics alone and had
+        # never seen the depth-independent geometry the project is built on.
+        if USE_GEOMETRY_FEATURES:
+            feature_cols += GEOMETRY_FEATURE_COLS
     else:
         feature_cols = [
             'height', 'width', 'box_area', 'pothole_area', 'nonpothole_area', 
@@ -766,7 +796,9 @@ def enhanced_evaluation(models_dict, X_train_scaled, X_val_scaled, y_train, y_va
         # --- Train geometry-only models for /analyze/geometry endpoint ---
         if available_curvature:
             print("\n=== Training Geometry-Only Models ===")
-            geometry_models_dir = os.path.join(os.path.dirname(MODELS_PATH), "ml_models", "geometry_only")
+            # MODELS_PATH already ends in ml_models[/extended]; joining "ml_models"
+            # again produced ml_models/ml_models/geometry_only.
+            geometry_models_dir = os.path.join(SCRIPT_DIR, "ml_models", "geometry_only")
             os.makedirs(geometry_models_dir, exist_ok=True)
 
             X_train_geo = df_train[available_curvature].values

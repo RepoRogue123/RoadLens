@@ -46,8 +46,25 @@ USE_SFS_DEPTH = False
 
 # ── paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODELS_DIR = os.path.join(SCRIPT_DIR, "ml_models")
 OUTPUT_DIR = os.path.join(SCRIPT_DIR, "output")
+
+
+def _resolve_models_dir() -> str:
+    """
+    Prefer ml_models/extended/ when it actually contains a trained scaler.
+
+    ml_classifier.py writes there when USE_MERGED_DATASET is on, while this
+    module historically only ever read ml_models/ — so a retrain silently
+    produced models the API never loaded. Preferring the extended directory
+    when populated fixes that without disturbing the existing root models.
+    """
+    extended = os.path.join(SCRIPT_DIR, "ml_models", "extended")
+    if os.path.isfile(os.path.join(extended, "feature_scaler.pkl")):
+        return extended
+    return os.path.join(SCRIPT_DIR, "ml_models")
+
+
+MODELS_DIR = _resolve_models_dir()
 
 # Feature column orders must match ml_classifier.py training exactly.
 FEATURE_COLS_11 = [
@@ -63,6 +80,22 @@ FEATURE_COLS_20 = [
     "depth_skewness", "depth_kurtosis", "boundary_gradient",
     "weighted_mean_depth", "surface_area_px2", "surface_area_cm2",
 ]
+
+# Phase 1 geometry columns, appended after FEATURE_COLS_20.
+# This order MUST match GEOMETRY_FEATURE_COLS in ml_classifier.py exactly —
+# the scaler and the models are positional, so a mismatch corrupts every
+# prediction silently rather than raising.
+GEOMETRY_FEATURE_COLS = [
+    "max_curvature", "mean_curvature", "std_curvature", "p90_curvature",
+    "high_curvature_fraction", "curvature_entropy", "concave_fraction",
+    "curvature_sign_changes", "contour_length", "contour_elongation",
+    "mean_bowl_depth", "max_bowl_depth", "std_bowl_depth",
+    "mean_road_curvature", "slope_variance",
+    "mean_normal_deviation", "max_normal_deviation",
+    "std_normal_deviation", "p90_normal_deviation",
+]
+
+FEATURE_COLS_39 = FEATURE_COLS_20 + GEOMETRY_FEATURE_COLS
 
 SEVERITY_MAP = {0: "Shallow", 1: "Moderate", 2: "Deep"}
 
@@ -218,6 +251,19 @@ def extract_ml_features(
     vec20 = np.array([float(extended.get(k, 0.0)) for k in FEATURE_COLS_20], dtype=np.float32)
     if expected_features == 20:
         return vec20.reshape(1, -1)
+
+    # Models retrained with the Phase 1 geometry block expect 39 features.
+    if expected_features == len(FEATURE_COLS_39):
+        try:
+            from features import extract_all_geometry_features
+            geo = extract_all_geometry_features(mask, depth_map) or {}
+        except ImportError:
+            geo = {}
+        combined = {**extended, **geo}
+        vec39 = np.array(
+            [float(combined.get(k, 0.0)) for k in FEATURE_COLS_39], dtype=np.float32
+        )
+        return vec39.reshape(1, -1)
 
     # Fallback for unexpected scaler sizes: use the first N extended features.
     if expected_features < len(FEATURE_COLS_20):
