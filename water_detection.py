@@ -436,6 +436,7 @@ def detect_water(
     curvature_features: Dict[str, Any] = None,
     water_prior_map: Optional[np.ndarray] = None,
     residual_map: Optional[np.ndarray] = None,
+    water_segmentation_map: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Detect water inside a pothole using a 6-cue edge-aware ensemble.
@@ -504,12 +505,6 @@ def detect_water(
     if residual_map is not None:
         residual_score = _specular_residual_score(residual_map, mask, surround_mask)
 
-    # ── Weighted ensemble ──
-    # Weights now live in water_config so they can be overridden by a fit
-    # against a labelled set. The defaults are the original hand-set values, so
-    # behaviour with only the base cues available is unchanged.
-    W = water_config.CUE_WEIGHTS
-    weights = {k: W[k] for k in water_config.BASE_CUES}
     scores = {
         'edge_density': edge_score,
         'gradient': gradient_score,
@@ -519,30 +514,60 @@ def detect_water(
     }
 
     # Optional cues join the ensemble only when their input was supplied. The
-    # division by total_weight below renormalises over whatever is present, so
-    # an absent cue abstains rather than voting zero.
+    # weighted mean below renormalises over whatever is present, so an absent
+    # cue abstains rather than voting zero.
     for name, value in (
         ('inconsistency', inconsistency_score),
         ('semantic', semantic_score),
         ('residual', residual_score),
     ):
         if value is not None:
-            weights[name] = W[name]
             scores[name] = value
 
-    if water_config.USE_LOGISTIC:
-        # Signed combination. Admits cues that argue AGAINST water, which the
-        # normalised sum below cannot express — see water_config.USE_LOGISTIC.
-        # Only cues present in BOTH the fitted coefficients and this call
-        # contribute, so an absent optional cue abstains rather than being
-        # treated as zero evidence.
+    # A fitted logistic is only valid when EVERY cue it was fitted on is
+    # actually present. The intercept absorbs the mean contribution of all of
+    # them: the HANYANG_TRAIN fit has intercept -4.81 against a `semantic`
+    # coefficient of +7.498, so evaluating it without `semantic` biases the
+    # result far downward and silently UNDER-detects water — the exact failure
+    # this phase exists to prevent. Refuse the calibration rather than apply it
+    # to the wrong feature set.
+    missing_cal_cues = [k for k in water_config.LOGISTIC_COEF if k not in scores]
+    use_logistic = water_config.USE_LOGISTIC and not missing_cal_cues
+
+    # When a calibration exists but cannot be applied, NOTHING else in that
+    # file is valid either: its clipped weights, 0.5 threshold and disabled
+    # corrections were produced alongside the logistic and never evaluated as a
+    # weighted mean. Falling back must therefore mean the whole hand-set
+    # configuration, not a hybrid of the two.
+    refused_calibration = water_config.USE_LOGISTIC and not use_logistic
+    if refused_calibration:
+        W = water_config.DEFAULT_CUE_WEIGHTS
+        threshold = water_config.DEFAULT_DECISION_THRESHOLD
+        bands = water_config.DEFAULT_CONFIDENCE_BANDS
+        C = water_config.DEFAULT_CORRECTIONS
+        corrections_applied = bool(water_config.DEFAULT_APPLY_CORRECTIONS)
+    else:
+        W = water_config.CUE_WEIGHTS
+        threshold = water_config.DECISION_THRESHOLD
+        bands = water_config.CONFIDENCE_BANDS
+        C = water_config.CORRECTIONS
+        corrections_applied = bool(water_config.APPLY_CORRECTIONS)
+
+    weights = {k: W[k] for k in scores}
+
+    if use_logistic:
         z = water_config.LOGISTIC_INTERCEPT
         for k, s in scores.items():
             c = water_config.LOGISTIC_COEF.get(k)
             if c is not None:
                 z += c * s
         water_prob = 1.0 / (1.0 + float(np.exp(-np.clip(z, -30.0, 30.0))))
+        combination = "logistic"
+        # The logistic already subsumes the corrections it was fitted without.
+        corrections_applied = False
     else:
+        combination = ("legacy_fallback_missing_cues"
+                       if refused_calibration else "legacy_weighted_mean")
         total_weight = sum(weights.values())
         water_prob = (sum(weights[k] * scores[k] for k in weights)
                       / max(total_weight, 1e-8))
@@ -552,8 +577,6 @@ def detect_water(
     # fix one named image, and the constants are recorded in water_config so the
     # evaluation harness can disable them wholesale and measure how much of the
     # behaviour they account for.
-    C = water_config.CORRECTIONS
-    corrections_applied = bool(water_config.APPLY_CORRECTIONS)
 
     if corrections_applied:
         # Boost: the two strongest cues agreeing compresses toward the high end.
@@ -576,8 +599,20 @@ def detect_water(
     water_prob = float(np.clip(water_prob, 0.0, 1.0))
 
     # ── Decision ──
-    bands = water_config.CONFIDENCE_BANDS
-    is_water = water_prob > water_config.DECISION_THRESHOLD
+    is_water = water_prob > threshold
+    ensemble_prob = water_prob
+    coverage = None
+
+    # The learned segmenter's share of this pothole, when its per-image map is
+    # supplied. It is always reported; it makes the call only when
+    # water_config.WATER_SEGMENTER_DECIDES (see water_config for why it does not yet).
+    if water_segmentation_map is not None:
+        coverage = float(water_segmentation_map[mask > 0].mean())
+    if coverage is not None and water_config.WATER_SEGMENTER_DECIDES:
+        water_prob = coverage
+        is_water = coverage > water_config.WATER_COVERAGE_THRESHOLD
+        bands = water_config.WATER_COVERAGE_BANDS
+        combination = "learned_segmenter"
 
     if water_prob > bands['high']:
         confidence_level = 'high'
@@ -602,4 +637,7 @@ def detect_water(
         'residual_score': round(residual_score, 4) if residual_score is not None else None,
         'cue_weights': {k: round(v, 3) for k, v in weights.items()},
         'corrections_applied': corrections_applied,
+        'combination': combination,
+        'ensemble_probability': round(ensemble_prob, 4),
+        'segmenter_coverage': round(coverage, 4) if coverage is not None else None,
     }

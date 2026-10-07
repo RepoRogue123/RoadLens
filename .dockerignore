@@ -34,6 +34,9 @@ stitch_1/
 yolo-segmentation/**
 !yolo-segmentation/model/
 !yolo-segmentation/model/best.pt
+!yolo-segmentation/model/best_v2.pt
+!yolo-segmentation/model/best_v3.pt
+!yolo-segmentation/model/water_best.pt
 
 # Local outputs and reports
 output/

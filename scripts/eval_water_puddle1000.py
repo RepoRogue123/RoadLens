@@ -305,6 +305,9 @@ def main() -> None:
                     help="Disable the hand-tuned non-linear corrections")
     ap.add_argument("--fit", action="store_true",
                     help="Fit cue weights + threshold and write water_params.json")
+    ap.add_argument("--segmenter", default=None,
+                    help="Learned water segmenter weights, optionally PATH@conf (default conf 0.25). "
+                         "Each region is scored by the share of it the segmenter marks as water.")
     args = ap.parse_args()
 
     subset = args.subset or os.path.basename(os.path.normpath(args.data))
@@ -332,6 +335,14 @@ def main() -> None:
         else:
             resid_fn = intrinsic_cues.residual_energy_map
             print(f"  cue 8: {intrinsic_cues.describe()}")
+
+    seg_model, seg_conf = None, 0.25
+    if args.segmenter:
+        from ultralytics import YOLO
+        from segmentation import _extract_binary_masks
+        path, _, conf = args.segmenter.partition("@")
+        seg_model, seg_conf = YOLO(path), float(conf) if conf else 0.25
+        print(f"  learned segmenter: {os.path.basename(path)} @ conf {seg_conf}")
 
     pairs = discover_pairs(args.data, args.images_sub, args.masks_sub)
     if not pairs:
@@ -363,6 +374,11 @@ def main() -> None:
         # Once per image, never per region.
         prior = prior_fn(rgb) if prior_fn else None
         resid = resid_fn(rgb) if resid_fn else None
+        seg_map = None
+        if seg_model is not None:
+            seg_map = np.zeros(gt.shape, dtype=bool)
+            for sm in _extract_binary_masks(bgr, seg_model, conf_threshold=seg_conf, min_area=50):
+                seg_map |= sm > 0
 
         for region in pos_regions:
             for label, m in ((1, region), (0, sample_negative(region, gt))):
@@ -383,6 +399,7 @@ def main() -> None:
                     "saturation": r["saturation_score"],
                     "semantic": r["semantic_score"],
                     "residual": r["residual_score"],
+                    "seg_cov": (float(seg_map[m > 0].mean()) if seg_map is not None else None),
                 })
 
         if k % 25 == 0 or k == len(pairs):
@@ -412,6 +429,14 @@ def main() -> None:
     if best_t is not None:
         report(f"best threshold on this set ({best_t:.2f})",
                metrics(y_true, (probs > best_t).astype(int)))
+
+    # Alternatives on the SAME regions (roadmap M3.4). Fixed 0.5 cut-offs, not tuned here.
+    if seg_model is not None:
+        cov = np.array([r["seg_cov"] for r in rows], dtype=float)
+        report("learned segmenter alone (covers > 50% of region)", metrics(y_true, (cov > 0.5).astype(int)))
+    sem = np.array([np.nan if r["semantic"] is None else r["semantic"] for r in rows], dtype=float)
+    if np.isfinite(sem).all():
+        report("CLIPSeg alone (semantic score > 0.5)", metrics(y_true, (sem > 0.5).astype(int)))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     csv_path = os.path.join(OUT_DIR, f"regions_{subset}.csv")

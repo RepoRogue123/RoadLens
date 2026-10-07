@@ -5,6 +5,9 @@ import RadarPulse from '../instrument/RadarPulse';
 
 export default function WaterHazardAlert({ waterAnalysis }) {
   if (!waterAnalysis?.waterDetected) return null;
+  // When the learned segmenter decides, the number is the share of the pothole it marks
+  // as water and the band is how much is covered. Neither is a certainty.
+  const bySegmenter = waterAnalysis.combination === 'learned_segmenter';
 
   return (
     <InstrumentPanel
@@ -25,26 +28,28 @@ export default function WaterHazardAlert({ waterAnalysis }) {
             <Droplets className="w-4 h-4 text-cyan-400 shrink-0" />
           </h3>
           <p className="text-sm text-slate-400 mt-1.5 leading-relaxed">
-            Water mirrors the sky, so the interior depth reading is not trustworthy.
-            Severity below is cross-checked against boundary geometry instead of raw depth.
+            Water mirrors the sky, so the interior depth reading is not trustworthy and the
+            severity verdict may understate this pothole. The cross-section below switches to
+            a predicted submerged floor extrapolated from the visible walls.
           </p>
         </div>
 
         <div className="flex items-center gap-6 shrink-0">
           <StatReadout
-            label="Probability"
+            label={bySegmenter ? 'Water coverage' : 'Probability'}
             value={`${(waterAnalysis.waterProbability * 100).toFixed(0)}%`}
             color="#ef4444"
           />
           <StatReadout
-            label="Confidence"
+            label={bySegmenter ? 'Extent' : 'Confidence'}
             value={(waterAnalysis.confidenceLevel || '—').toUpperCase()}
             color="#fbbf24"
             size="sm"
           />
           {waterAnalysis.inconsistencyScore > 0.6 && (
             <StatReadout
-              label="SfS inconsistency"
+              /* Water cue 6: boundary curvature says crater, interior depth says flat. */
+              label="Depth inconsistency"
               value={waterAnalysis.inconsistencyScore.toFixed(2)}
               color="#f97316"
               size="sm"

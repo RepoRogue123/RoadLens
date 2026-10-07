@@ -100,6 +100,28 @@ def timestamp_key(path: str):
     return m.group(1) if m else None
 
 
+# Frames closer together than this belong to one capture session. 29% of PothRGBD
+# frames follow the previous one within 10 s — the operator shooting along one
+# stretch of road, sometimes the same pothole twice — so any split must keep a
+# session on one side. Splitting by frame alone overstated the depth model's Deep
+# recall (0.70 by frame, 0.37 by session; MASTER_DOC 2026-09-25).
+SESSION_GAP_S = 60
+
+
+def capture_sessions(keys, gap_s: float = SESSION_GAP_S):
+    """Map each frame key (YYYYMMDD_HHMMSS...) to a capture-session id."""
+    from datetime import datetime
+    times = {k: datetime.strptime(k[:15], "%Y%m%d_%H%M%S").timestamp() for k in set(keys)}
+    ordered = sorted(times, key=times.get)
+    session, sid, prev = {}, 0, None
+    for k in ordered:
+        if prev is not None and times[k] - prev > gap_s:
+            sid += 1
+        session[k] = sid
+        prev = times[k]
+    return session
+
+
 def load_polygons(label_path: str, h: int, w: int):
     """YOLO-seg polygons -> list of binary masks, one per annotated pothole."""
     masks = []

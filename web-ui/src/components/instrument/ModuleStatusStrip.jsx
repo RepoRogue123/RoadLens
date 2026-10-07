@@ -11,6 +11,7 @@ import { CheckCircle2, MinusCircle, AlertTriangle } from 'lucide-react';
  */
 
 const LABELS = {
+  metric: 'Depth model',
   geometry: 'Geometry',
   semantic: 'Semantic',
   water: 'Water',
@@ -55,7 +56,7 @@ function StatusPill({ id, mod }) {
 export default function ModuleStatusStrip({ moduleStatus }) {
   if (!moduleStatus) return null;
 
-  const order = ['geometry', 'semantic', 'water', 'temporal'];
+  const order = ['metric', 'geometry', 'semantic', 'water', 'temporal'];
   const degraded = order.filter((k) => moduleStatus[k] && !moduleStatus[k].available);
 
   return (

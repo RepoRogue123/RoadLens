@@ -31,17 +31,14 @@ from classifier import classify_severity                  # noqa: E402
 from features import extract_depth_features               # noqa: E402
 from foundation_features import extract_foundation_features  # noqa: E402
 
-PATCH = 14  # DINOv2 patch grid is 14x14 over the resized input
-
 OVERRIDE_RATIO = 0.9
 BORDERLINE_LO, BORDERLINE_HI = 0.80, 1.05
 MIN_PATCHES = 8
 
-
-def patches_covered(mask):
-    """How many of the 14x14 DINOv2 patches the mask actually covers."""
-    small = cv2.resize(mask.astype(np.uint8), (PATCH, PATCH), interpolation=cv2.INTER_AREA)
-    return int((small > 0).sum())
+# Patch coverage is taken from the extractor (`dinov2_patch_count`), which maps
+# the mask through the processor's resize + centre crop onto the real 16x16
+# grid. A local 14x14 resize of the uncropped mask counted a different grid over
+# a different region, so its numbers never matched what the override saw.
 
 
 def main():
@@ -79,7 +76,7 @@ def main():
         iv = feats["dinov2_inside_variance"]
         ov = feats["dinov2_outside_variance"]
         ratio = iv / ov if ov > 1e-9 else float("nan")
-        npatch = patches_covered(mask)
+        npatch = int(feats.get("dinov2_patch_count", 0))
 
         flags = []
         if BORDERLINE_LO <= ratio <= BORDERLINE_HI:

@@ -3,6 +3,7 @@ import csv
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import cv2
@@ -51,15 +52,38 @@ try:
 except Exception:
     _HAS_INTRINSIC = False
 
+# Learned water segmenter — the primary water decision when its weights exist.
+try:
+    import water_segmenter
+    _HAS_WATER_SEGMENTER = water_segmenter.HAS_WATER_SEGMENTER
+except Exception:
+    _HAS_WATER_SEGMENTER = False
+
 try:
     from temporal_analysis import estimate_pothole_age, predict_severity_progression
     _HAS_TEMPORAL = True
 except ImportError:
     _HAS_TEMPORAL = False
 
+# Measured-label depth model: MoGe geometry + a regressor fitted on RealSense
+# labels. When present it supplies the headline severity (metric_severity.SEVERITY_MODE);
+# the rule + pseudo-label vote is kept in the response for comparison.
+try:
+    import metric_severity
+    _HAS_METRIC = metric_severity.HAS_METRIC
+except Exception:
+    _HAS_METRIC = False
+
 app = FastAPI(title="Pothole Detection API")
 PROJECT_ROOT = Path(__file__).resolve().parent
 ML_RESULTS_DIR = PROJECT_ROOT / "ml_results"
+
+# /analyze runs in FastAPI's threadpool (it is a plain `def`), so the event loop
+# stays free for /healthz and /insights while a scan computes. The shared YOLO,
+# Depth-Anything, DINOv2 and CLIPSeg singletons are not safe to drive from two
+# threads at once, so scans are serialised: concurrent requests queue here
+# instead of interleaving forward passes on the same model objects.
+_PIPELINE_LOCK = threading.Lock()
 
 
 def _get_allowed_origins() -> List[str]:
@@ -500,6 +524,31 @@ def majority_vote(verdicts: List[str]) -> Tuple[str, int, int]:
     return winner, counts[winner], len(verdicts)
 
 
+def semantic_override(consensus: str, rule_severity: str, ratio, n_patches: int
+                      ) -> Tuple[str, str, bool]:
+    """
+    Apply the DINOv2 material check to a voted verdict.
+
+    Returns (final_severity, semantic_verdict, illusion_warning). Two-way: an
+    interior much smoother than the road around it downgrades an over-reported
+    Deep; a much more heterogeneous one raises an under-reported Shallow. Abstains
+    when the interior covers too few patches for a variance to mean anything.
+    """
+    if ratio is None or ratio != ratio:  # missing or NaN
+        return consensus, "unavailable", False
+    if n_patches < semantic_config.MIN_PATCHES:
+        return consensus, "abstained_sparse_patches", False
+    if ratio < semantic_config.DOWNGRADE_RATIO:
+        if consensus == "Deep" or rule_severity == "Deep":
+            return "Shallow", "downgraded_texture_illusion", True
+        return consensus, "smooth_interior_no_action", False
+    if ratio > semantic_config.UPGRADE_RATIO:
+        if normalize_severity(consensus) == "Shallow":
+            return "Moderate", "raised_heterogeneous_interior", False
+        return consensus, "heterogeneous_interior_confirms", False
+    return consensus, "inconclusive", False
+
+
 def mask_to_bbox(mask: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
     ys, xs = np.where(mask > 0)
     if xs.size == 0 or ys.size == 0:
@@ -613,10 +662,15 @@ def _water_cue_status(first: Dict) -> Dict[str, str]:
             _HAS_INTRINSIC,
             wa.get("residualScore") is not None,
         ),
+        "segmenter": optional(
+            bool(_HAS_WATER_DETECTION and water_config.ENABLE_WATER_SEGMENTER),
+            _HAS_WATER_SEGMENTER,
+            wa.get("segmenterCoverage") is not None,
+        ),
     }
 
 
-def _module_status(potholes: List[Dict]) -> Dict[str, Dict]:
+def _module_status(representative: Optional[Dict]) -> Dict[str, Dict]:
     """
     Report which analysis witnesses actually ran.
 
@@ -625,8 +679,11 @@ def _module_status(potholes: List[Dict]) -> Dict[str, Dict]:
     warning while the response still looked complete. A confident answer with a
     silently absent witness is worse than a visibly degraded one, so the state
     is now reported explicitly and surfaced in the UI.
+
+    Reported for the REPRESENTATIVE pothole — the same one that supplies the
+    headline verdict — so status and verdict always describe one pothole.
     """
-    first = potholes[0] if potholes else {}
+    first = representative or {}
     geo = first.get("geometryAnalysis", {}) or {}
     has_dinov2 = bool(geo.get("foundationFeatures"))
 
@@ -648,13 +705,24 @@ def _module_status(potholes: List[Dict]) -> Dict[str, Dict]:
             "ran": first.get("waterAnalysis") is not None,
             "calibrated": water_config.IS_CALIBRATED if _HAS_WATER_DETECTION else False,
             "cues": _water_cue_status(first),
-            "detail": (water_config.describe() if _HAS_WATER_DETECTION
-                       else "water detection unavailable"),
+            # Name the rule that actually made the call for this pothole.
+            "detail": ("water detection unavailable" if not _HAS_WATER_DETECTION
+                       else water_segmenter.describe() + "; cue ensemble: " + water_config.describe()
+                       if (first.get("waterAnalysis") or {}).get("combination") == "learned_segmenter"
+                       else water_config.describe()),
         },
         "temporal": {
             "available": bool(_HAS_TEMPORAL),
             "ran": first.get("temporalAnalysis") is not None,
             "detail": "age estimation and 30/60/90-day progression",
+        },
+        "metric": {
+            "available": bool(_HAS_METRIC),
+            "ran": first.get("metricDepth") is not None,
+            "calibrated": bool(_HAS_METRIC),
+            "primary": first.get("severitySource") == "metric",
+            "detail": (metric_severity.describe() if _HAS_METRIC
+                       else "measured-label depth model unavailable (needs MoGe and ml_models/metric/)"),
         },
     }
 
@@ -779,368 +847,432 @@ def _build_graph_manifest() -> List[Dict[str, str]]:
 
 
 @app.post("/analyze")
-async def analyze_image(file: UploadFile = File(...)):
-    # 1. Save uploaded file temporarily
+def analyze_image(file: UploadFile = File(...)):
+    # Deliberately NOT `async def`. Every stage below is synchronous CPU/GPU
+    # work; inside a coroutine it would block the event loop for the whole scan,
+    # stalling every other request — including /healthz — on a single worker.
+    # A plain `def` endpoint is executed in the threadpool instead.
     with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
-        contents = await file.read()
-        tmp.write(contents)
+        tmp.write(file.file.read())
         tmp_path = tmp.name
 
     try:
-        # ── 1. Read image and segment all potholes ──
-        original_image = cv2.imread(tmp_path)
-        if original_image is None:
-            raise FileNotFoundError("Unable to read uploaded image")
-
-        masks = get_all_masks(tmp_path)
-
-        # ── 2. Depth estimation ──
-        depth_map = get_depth_map(original_image)
-        if depth_map.shape != original_image.shape[:2]:
-            depth_map = cv2.resize(
-                depth_map,
-                (original_image.shape[1], original_image.shape[0]),
-                interpolation=cv2.INTER_LINEAR,
-            )
-
-        # ── 2b. Image-level water cue inputs ──
-        # Computed once per IMAGE, never per pothole: both are full forward
-        # passes, and a frame with seven potholes would otherwise pay for them
-        # seven times. Both gated off by default — see water_config.
-        water_prior = None
-        residual_map = None
-        if _HAS_WATER_DETECTION:
-            if _HAS_SEMANTIC_WATER and water_config.ENABLE_SEMANTIC_CUE:
-                try:
-                    water_prior = semantic_water.water_prior_map(
-                        cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
-                    )
-                except Exception:
-                    water_prior = None
-            if _HAS_INTRINSIC and water_config.ENABLE_RESIDUAL_CUE:
-                try:
-                    residual_map = intrinsic_cues.residual_energy_map(
-                        cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
-                    )
-                except Exception:
-                    residual_map = None
-
-        # ── 3. Load ML artifacts once ──
-        scaler = None
-        ml_models = {}
-        try:
-            scaler, ml_models = load_ml_artifacts()
-        except FileNotFoundError:
-            scaler, ml_models = None, {}
-
-        expected_features = int(getattr(scaler, "n_features_in_", 11)) if scaler is not None else 11
-
-        # ── 4. Per-pothole analysis ──
-        potholes: List[Dict[str, object]] = []
-        mask_records: List[Tuple[np.ndarray, Dict[str, object]]] = []
-
-        for idx, mask in enumerate(masks, start=1):
-            depth_features = extract_depth_features(mask, depth_map)
-            if depth_features is None:
-                continue
-
-            rule_severity = normalize_severity(classify_severity(depth_features))
-            ml_predictions: Dict[str, str] = {}
-
-            ml_feature_vec = extract_ml_features(mask, depth_map, expected_features)
-            if ml_feature_vec is not None and scaler is not None and ml_models:
-                X_scaled = scaler.transform(ml_feature_vec)
-                for name, model in ml_models.items():
-                    label = int(model.predict(X_scaled)[0])
-                    severity = normalize_severity(SEVERITY_MAP.get(label, f"Unknown({label})"))
-                    display_name = name.replace("_", " ").title()
-                    if name == "svm":
-                        display_name = "SVM (RBF Kernel)"
-                    ml_predictions[display_name] = severity
-
-            classifications = {
-                "Rule-Based": rule_severity,
-                **ml_predictions,
-            }
-
-            consensus, consensus_count, total_classifiers = majority_vote(
-                list(classifications.values())
-            )
-
-            bbox = mask_to_bbox(mask)
-            bbox_obj = None
-            if bbox is not None:
-                bbox_obj = {
-                    "x1": int(bbox[0]),
-                    "y1": int(bbox[1]),
-                    "x2": int(bbox[2]),
-                    "y2": int(bbox[3]),
-                }
-
-            features = feature_bundle(depth_features)
-            pothole = {
-                "id": int(idx),
-                "bbox": bbox_obj,
-                "features": features,
-                "classifications": classifications,
-                "consensusSeverity": str(consensus),
-                "consensusCount": int(consensus_count),
-                "totalClassifiers": int(total_classifiers),
-            }
-
-            # Geometry & DINOv2 features (novel extension — additive only)
-            if _HAS_GEOMETRY:
-                try:
-                    image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
-                    geo_feats = extract_all_geometry_features(mask, depth_map, image_rgb)
-                    if geo_feats is not None:
-                        pothole["geometryAnalysis"] = {
-                            "curvatureFeatures": {
-                                k: round(float(v), 6) if isinstance(v, (int, float)) else v
-                                for k, v in geo_feats.items() if not k.startswith("dinov2")
-                            },
-                        }
-                        
-                        # Extract DINOv2 foundation features specifically into a sub-object
-                        dinov2_features = {k: v for k, v in geo_feats.items() if k.startswith("dinov2")}
-                        if dinov2_features:
-                            ratio = dinov2_features.get(semantic_config.RATIO_KEY)
-                            n_patches = int(dinov2_features.get("dinov2_patch_count", 0))
-
-                            pothole["geometryAnalysis"]["foundationFeatures"] = {
-                                "dissimilarity": round(dinov2_features.get("dinov2_dissimilarity", 0), 4),
-                                "insideVariance": round(dinov2_features.get("dinov2_inside_variance", 0), 4),
-                                "outsideVariance": round(dinov2_features.get("dinov2_outside_variance", 0), 4),
-                                # Corrected, ring-local, size-matched comparison (A1)
-                                "ringVariance": round(dinov2_features.get("dinov2_ring_variance", 0), 4),
-                                "varianceRatio": round(ratio, 4) if ratio is not None else None,
-                                "patchCount": n_patches,
-                                "calibrated": semantic_config.IS_CALIBRATED,
-                            }
-
-                            # ── Semantic Verification Override ──
-                            # A real crater is materially heterogeneous (rubble, cracks,
-                            # internal shadow); a flat illusion is smoother than the road
-                            # around it. The ratio compares interior against a local ring
-                            # of road patches, sampled to the same patch count.
-                            #
-                            # Two-way: strong smoothness downgrades an over-reported
-                            # verdict; strong heterogeneity raises an under-reported one
-                            # (the Phase 1 "dry, shadowless flattening" failure mode,
-                            # which the old one-way rule structurally could not act on).
-                            #
-                            # Abstains when the interior covers too few patches for the
-                            # variance to mean anything.
-                            if ratio is None or ratio != ratio:  # missing or NaN
-                                pothole["semanticVerdict"] = "unavailable"
-                            elif n_patches < semantic_config.MIN_PATCHES:
-                                pothole["semanticVerdict"] = "abstained_sparse_patches"
-                            elif ratio < semantic_config.DOWNGRADE_RATIO:
-                                if consensus == "Deep" or rule_severity == "Deep":
-                                    pothole["consensusSeverity"] = "Shallow"
-                                    pothole["illusionWarning"] = True
-                                    pothole["semanticVerdict"] = "downgraded_texture_illusion"
-                                else:
-                                    pothole["semanticVerdict"] = "smooth_interior_no_action"
-                            elif ratio > semantic_config.UPGRADE_RATIO:
-                                if normalize_severity(consensus) == "Shallow":
-                                    pothole["consensusSeverity"] = "Moderate"
-                                    pothole["semanticVerdict"] = "raised_heterogeneous_interior"
-                                else:
-                                    pothole["semanticVerdict"] = "heterogeneous_interior_confirms"
-                            else:
-                                pothole["semanticVerdict"] = "inconclusive"
-                except Exception:
-                    pass  # graceful degradation
-
-            # Water detection (novel extension — additive only)
-            if _HAS_WATER_DETECTION:
-                try:
-                    image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
-                    curv_feats = extract_curvature_features(mask) if _HAS_GEOMETRY else None
-                    water_result = _detect_water(
-                        image_rgb, mask,
-                        depth_map=depth_map,
-                        curvature_features=curv_feats,
-                        water_prior_map=water_prior,
-                        residual_map=residual_map,
-                    )
-                    if water_result is not None:
-                        pothole["waterAnalysis"] = {
-                            "waterDetected": water_result.get('is_water', False),
-                            "waterProbability": water_result.get('water_probability', 0.0),
-                            "confidenceLevel": water_result.get('confidence_level', 'low'),
-                            "inconsistencyScore": water_result.get('inconsistency_score'),
-                            "semanticScore": water_result.get('semantic_score'),
-                            "residualScore": water_result.get('residual_score'),
-                            "cueWeights": water_result.get('cue_weights'),
-                            "correctionsApplied": water_result.get('corrections_applied'),
-                        }
-                except Exception:
-                    pass  # graceful degradation
-                    
-            # Temporal Analysis (novel extension — additive only)
-            if _HAS_TEMPORAL:
-                try:
-                    image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
-                    age_estimate = estimate_pothole_age(mask, image_rgb)
-                    if age_estimate:
-                        progression = predict_severity_progression(
-                            current_severity=rule_severity,
-                            age_estimate=age_estimate,
-                            weather_context="freeze_thaw"
-                        )
-                        pothole["temporalAnalysis"] = {
-                            "ageCategory": age_estimate["age_category"],
-                            "ageScore": round(age_estimate["age_score"], 2),
-                            "ageDescription": age_estimate["age_description"],
-                            "edgeSharpness": round(age_estimate["edge_sharpness"], 2),
-                            "crackTexture": round(age_estimate["crack_texture_score"], 2),
-                            "progression": {
-                                "30d": progression["prediction_30d"]["severity"],
-                                "60d": progression["prediction_60d"]["severity"],
-                                "90d": progression["prediction_90d"]["severity"],
-                            }
-                        }
-                except Exception:
-                    pass
-
-            # Depth cross-section profile for interpretable charting
-            try:
-                water_detected = pothole.get("waterAnalysis", {}).get("waterDetected", False)
-                severity = pothole.get("consensusSeverity", "Moderate")
-                image_gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
-                
-                # If an illusion was detected, physically flatten the depth map inside the mask 
-                # before generating the cross-section chart to reflect true shallow geometry.
-                chart_depth_map = depth_map
-                if pothole.get("illusionWarning"):
-                    chart_depth_map = depth_map.copy()
-                    road_mean = np.mean(chart_depth_map[mask == 0]) if np.any(mask == 0) else np.mean(chart_depth_map)
-                    chart_depth_map = np.where(mask > 0, 
-                                               chart_depth_map * 0.15 + (road_mean * 0.85), 
-                                               chart_depth_map)
-
-                depth_profile = compute_depth_slice(
-                    mask, chart_depth_map, water_detected=water_detected, severity=severity, image_gray=image_gray
-                )
-                if depth_profile:
-                    pothole["depthProfile"] = depth_profile
-            except Exception:
-                pass  # graceful degradation
-
-            potholes.append(pothole)
-            mask_records.append((mask, pothole))
-
-        # Choose one representative pothole for backward-compatible fields.
-        representative = None
-        if potholes:
-            representative = max(
-                potholes,
-                key=lambda p: (
-                    severity_rank(str(p["consensusSeverity"])),
-                    float(p["features"].get("pothole_area", 0)),
-                ),
-            )
-
-        # ── 5. Build Visualization Images ──
-        img_original = encode_image(original_image)
-
-        overlay_mask = original_image.copy()
-        for mask, pothole in mask_records:
-            severity = str(pothole["consensusSeverity"])
-            color = SEVERITY_COLORS_BGR.get(severity, (255, 255, 255))
-
-            tint = np.zeros_like(original_image)
-            tint[:, :, 0] = color[0]
-            tint[:, :, 1] = color[1]
-            tint[:, :, 2] = color[2]
-            blended = cv2.addWeighted(original_image, 0.45, tint, 0.55, 0)
-            overlay_mask[mask == 1] = blended[mask == 1]
-
-            bbox_obj = pothole.get("bbox")
-            if bbox_obj is not None:
-                bbox = (
-                    int(bbox_obj["x1"]),
-                    int(bbox_obj["y1"]),
-                    int(bbox_obj["x2"]),
-                    int(bbox_obj["y2"]),
-                )
-                lines = [
-                    f"P{pothole['id']}: {severity}",
-                    f"Area: {pothole['features'].get('pothole_area', 0)}",
-                    f"Drop: {pothole['features'].get('local_depth_contrast', 0.0):.3f}",
-                ]
-                draw_labeled_bbox(overlay_mask, bbox, lines, box_color=color)
-
-        img_mask = encode_image(overlay_mask)
-
-        depth_norm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        depth_heatmap = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
-        img_depth = encode_image(depth_heatmap)
-
-        # Annotated depth overlay (contours, markers, slice lines)
-        depth_annotated_img = build_depth_annotated_image(
-            original_image, depth_map, mask_records,
-        )
-        img_depth_annotated = encode_image(depth_annotated_img)
-
-        schematic_img = build_schematic_image(original_image.shape, potholes)
-        img_schematic = encode_image(schematic_img)
-
-        if representative is None:
-            consensus_text = "No Pothole"
-            consensus_subtext = "Detected by 1 of 1 classifiers"
-            features = feature_bundle(None)
-            classifications = {"Rule-Based": "No Pothole"}
-            consensus_count = 1
-            total_classifiers = 1
-            bbox = None
-        else:
-            consensus_text = str(representative["consensusSeverity"])
-            pothole_count = len(potholes)
-            consensus_subtext = f"Worst severity among {pothole_count} pothole(s)"
-            features = representative["features"]
-            classifications = representative["classifications"]
-            consensus_count = int(representative["consensusCount"])
-            total_classifiers = int(representative["totalClassifiers"])
-            bbox = representative["bbox"]
-
-        # Detect if any pothole has water
-        has_water_filled = any(
-            p.get("waterAnalysis", {}).get("waterDetected", False)
-            for p in potholes
-        )
-
-        return JSONResponse(
-            {
-                "success": True,
-                "potholeCount": len(potholes),
-                "consensusSeverity": consensus_text,
-                "consensusSubtext": consensus_subtext,
-                "consensusCount": consensus_count,
-                "totalClassifiers": total_classifiers,
-                "features": features,
-                "classifications": classifications,
-                "moduleStatus": _module_status(potholes),
-                "potholes": potholes,
-                "images": {
-                    "original": img_original,
-                    "maskOverlay": img_mask,
-                    "depthHeatmap": img_depth,
-                    "depthAnnotated": img_depth_annotated,
-                    "schematic": img_schematic,
-                },
-                "bbox": bbox,
-                "hasWaterFilledPotholes": has_water_filled,
-            }
-        )
-
+        with _PIPELINE_LOCK:
+            return _run_analysis(tmp_path)
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def _run_analysis(tmp_path: str) -> JSONResponse:
+    """The full per-image pipeline. Caller owns the temp file and the lock."""
+    # ── 1. Read image and segment all potholes ──
+    original_image = cv2.imread(tmp_path)
+    if original_image is None:
+        raise FileNotFoundError("Unable to read uploaded image")
+
+    masks = get_all_masks(tmp_path)
+
+    # ── 2. Depth estimation ──
+    depth_map = get_depth_map(original_image)
+    if depth_map.shape != original_image.shape[:2]:
+        depth_map = cv2.resize(
+            depth_map,
+            (original_image.shape[1], original_image.shape[0]),
+            interpolation=cv2.INTER_LINEAR,
+        )
+
+    # ── 2b. Image-level water cue inputs ──
+    # Computed once per IMAGE, never per pothole: both are full forward
+    # passes, and a frame with seven potholes would otherwise pay for them
+    # seven times. Both gated off by default — see water_config.
+    water_prior = None
+    residual_map = None
+    if _HAS_WATER_DETECTION:
+        if _HAS_SEMANTIC_WATER and water_config.ENABLE_SEMANTIC_CUE:
+            try:
+                water_prior = semantic_water.water_prior_map(
+                    cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                )
+            except Exception:
+                water_prior = None
+        if _HAS_INTRINSIC and water_config.ENABLE_RESIDUAL_CUE:
+            try:
+                residual_map = intrinsic_cues.residual_energy_map(
+                    cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                )
+            except Exception:
+                residual_map = None
+
+    # Learned water segmenter: one pass per image; None falls back to the ensemble.
+    water_seg_map = None
+    if _HAS_WATER_DETECTION and _HAS_WATER_SEGMENTER:
+        water_seg_map = water_segmenter.water_map(original_image)
+
+    # ── 2c. Measured-label depth model: MoGe once per image ──
+    # Measured against RealSense on 742 YOLO-detected potholes, the legacy vote
+    # was right 25.5% of the time (below always answering "Moderate"); this
+    # model 50.7%, with fewer under-reported hazards (56 against 85).
+    metric_geometry = None
+    if _HAS_METRIC and masks:
+        metric_geometry = metric_severity.geometry_for_image(original_image, masks)
+    metric_primary = metric_geometry is not None and metric_severity.is_primary()
+
+    # ── 3. Load ML artifacts once ──
+    scaler = None
+    ml_models = {}
+    try:
+        scaler, ml_models = load_ml_artifacts()
+    except FileNotFoundError:
+        scaler, ml_models = None, {}
+
+    expected_features = int(getattr(scaler, "n_features_in_", 11)) if scaler is not None else 11
+
+    # ── 4. Per-pothole analysis ──
+    potholes: List[Dict[str, object]] = []
+    mask_records: List[Tuple[np.ndarray, Dict[str, object]]] = []
+
+    for idx, mask in enumerate(masks, start=1):
+        depth_features = extract_depth_features(mask, depth_map)
+        if depth_features is None:
+            continue
+
+        rule_severity = normalize_severity(classify_severity(depth_features))
+        ml_predictions: Dict[str, str] = {}
+
+        ml_feature_vec = extract_ml_features(mask, depth_map, expected_features)
+        if ml_feature_vec is not None and scaler is not None and ml_models:
+            X_scaled = scaler.transform(ml_feature_vec)
+            for name, model in ml_models.items():
+                label = int(model.predict(X_scaled)[0])
+                severity = normalize_severity(SEVERITY_MAP.get(label, f"Unknown({label})"))
+                display_name = name.replace("_", " ").title()
+                if name == "svm":
+                    display_name = "SVM (RBF Kernel)"
+                ml_predictions[display_name] = severity
+
+        classifications = {
+            "Rule-Based": rule_severity,
+            **ml_predictions,
+        }
+
+        consensus, consensus_count, total_classifiers = majority_vote(
+            list(classifications.values())
+        )
+        legacy_vote = consensus
+
+        metric = metric_severity.predict(metric_geometry, idx - 1) if metric_geometry is not None else None
+        if metric is not None:
+            classifications["Depth Model (measured)"] = metric["severity"]
+            if metric_primary:
+                consensus = metric["severity"]
+            consensus_count = sum(1 for v in classifications.values() if v == consensus)
+            total_classifiers = len(classifications)
+
+        bbox = mask_to_bbox(mask)
+        bbox_obj = None
+        if bbox is not None:
+            bbox_obj = {
+                "x1": int(bbox[0]),
+                "y1": int(bbox[1]),
+                "x2": int(bbox[2]),
+                "y2": int(bbox[3]),
+            }
+
+        features = feature_bundle(depth_features)
+        pothole = {
+            "id": int(idx),
+            "bbox": bbox_obj,
+            "features": features,
+            "classifications": classifications,
+            "consensusSeverity": str(consensus),
+            "consensusCount": int(consensus_count),
+            "totalClassifiers": int(total_classifiers),
+            "severitySource": "metric" if (metric_primary and metric is not None) else "legacy_vote",
+            "legacyVote": str(legacy_vote),
+        }
+        if metric is not None:
+            pothole["metricDepth"] = metric
+
+        # Geometry & DINOv2 features (novel extension — additive only)
+        if _HAS_GEOMETRY:
+            try:
+                image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                geo_feats = extract_all_geometry_features(mask, depth_map, image_rgb)
+                if geo_feats is not None:
+                    pothole["geometryAnalysis"] = {
+                        "curvatureFeatures": {
+                            k: round(float(v), 6) if isinstance(v, (int, float)) else v
+                            for k, v in geo_feats.items() if not k.startswith("dinov2")
+                        },
+                    }
+
+                    # Extract DINOv2 foundation features specifically into a sub-object
+                    dinov2_features = {k: v for k, v in geo_feats.items() if k.startswith("dinov2")}
+                    if dinov2_features:
+                        ratio = dinov2_features.get(semantic_config.RATIO_KEY)
+                        n_patches = int(dinov2_features.get("dinov2_patch_count", 0))
+
+                        pothole["geometryAnalysis"]["foundationFeatures"] = {
+                            "dissimilarity": round(dinov2_features.get("dinov2_dissimilarity", 0), 4),
+                            "insideVariance": round(dinov2_features.get("dinov2_inside_variance", 0), 4),
+                            "outsideVariance": round(dinov2_features.get("dinov2_outside_variance", 0), 4),
+                            # Corrected, ring-local, size-matched comparison (A1)
+                            "ringVariance": round(dinov2_features.get("dinov2_ring_variance", 0), 4),
+                            "varianceRatio": round(ratio, 4) if ratio is not None else None,
+                            "patchCount": n_patches,
+                            "calibrated": semantic_config.IS_CALIBRATED,
+                        }
+
+                        # ── Semantic Verification Override ──
+                        # A real crater is materially heterogeneous (rubble, cracks,
+                        # internal shadow); a flat illusion is smoother than the road
+                        # around it. The ratio compares interior against a local ring
+                        # of road patches, sampled to the same patch count.
+                        #
+                        # Two-way: strong smoothness downgrades an over-reported
+                        # verdict; strong heterogeneity raises an under-reported one
+                        # (the Phase 1 "dry, shadowless flattening" failure mode,
+                        # which the old one-way rule structurally could not act on).
+                        #
+                        # Abstains when the interior covers too few patches for the
+                        # variance to mean anything.
+                        final, verdict, illusion = semantic_override(
+                            consensus, rule_severity, ratio, n_patches)
+                        pothole["semanticVerdict"] = verdict
+                        if pothole["severitySource"] == "metric":
+                            # Advisory only. Applied to measured-depth verdicts the
+                            # uncalibrated override raised under-reported potholes
+                            # from 56 to 101 of 742 (served_severity_comparison.json).
+                            if final != consensus:
+                                pothole["semanticSuggestion"] = final
+                        else:
+                            pothole["consensusSeverity"] = final
+                            if illusion:
+                                pothole["illusionWarning"] = True
+
+                        # An override replaces the verdict, so the agreement
+                        # figure must describe the NEW verdict. consensusCount was
+                        # taken from the vote; left alone, a Deep 5/5 downgraded
+                        # to Shallow would report "Shallow · 5/5 agree" when no
+                        # classifier said Shallow at all.
+                        if pothole["consensusSeverity"] != consensus:
+                            pothole["votedSeverity"] = str(consensus)
+                            pothole["consensusCount"] = sum(
+                                1 for v in classifications.values()
+                                if v == pothole["consensusSeverity"]
+                            )
+            except Exception:
+                pass  # graceful degradation
+
+        # Water detection (novel extension — additive only)
+        if _HAS_WATER_DETECTION:
+            try:
+                image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                curv_feats = extract_curvature_features(mask) if _HAS_GEOMETRY else None
+                water_result = _detect_water(
+                    image_rgb, mask,
+                    depth_map=depth_map,
+                    curvature_features=curv_feats,
+                    water_prior_map=water_prior,
+                    residual_map=residual_map,
+                    water_segmentation_map=water_seg_map,
+                )
+                if water_result is not None:
+                    pothole["waterAnalysis"] = {
+                        "waterDetected": water_result.get('is_water', False),
+                        "waterProbability": water_result.get('water_probability', 0.0),
+                        "confidenceLevel": water_result.get('confidence_level', 'low'),
+                        "inconsistencyScore": water_result.get('inconsistency_score'),
+                        "semanticScore": water_result.get('semantic_score'),
+                        "residualScore": water_result.get('residual_score'),
+                        "cueWeights": water_result.get('cue_weights'),
+                        "correctionsApplied": water_result.get('corrections_applied'),
+                        # Which decision rule produced the probability:
+                        # "logistic" (calibrated), or a fallback when a
+                        # calibrated cue was unavailable.
+                        "combination": water_result.get('combination'),
+                        # With the learned segmenter deciding, the share of the
+                        # pothole it marks as water; the cue ensemble's own
+                        # probability is kept for comparison.
+                        "segmenterCoverage": water_result.get('segmenter_coverage'),
+                        "ensembleProbability": water_result.get('ensemble_probability'),
+                    }
+            except Exception:
+                pass  # graceful degradation
+
+        # Temporal Analysis (novel extension — additive only)
+        if _HAS_TEMPORAL:
+            try:
+                image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+                age_estimate = estimate_pothole_age(mask, image_rgb)
+                if age_estimate:
+                    # Forecast from the verdict the user is shown (consensus,
+                    # after any semantic override), not the rule-based vote —
+                    # otherwise the timeline starts from one severity and
+                    # "progresses" from another.
+                    progression = predict_severity_progression(
+                        current_severity=pothole["consensusSeverity"],
+                        age_estimate=age_estimate,
+                        weather_context="freeze_thaw"
+                    )
+                    pothole["temporalAnalysis"] = {
+                        "ageCategory": age_estimate["age_category"],
+                        "ageScore": round(age_estimate["age_score"], 2),
+                        "ageDescription": age_estimate["age_description"],
+                        "edgeSharpness": round(age_estimate["edge_sharpness"], 2),
+                        "crackTexture": round(age_estimate["crack_texture_score"], 2),
+                        "progression": {
+                            "30d": progression["prediction_30d"]["severity"],
+                            "60d": progression["prediction_60d"]["severity"],
+                            "90d": progression["prediction_90d"]["severity"],
+                        }
+                    }
+            except Exception:
+                pass
+
+        # Depth cross-section profile for interpretable charting
+        try:
+            water_detected = pothole.get("waterAnalysis", {}).get("waterDetected", False)
+            severity = pothole.get("consensusSeverity", "Moderate")
+            image_gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+
+            # If an illusion was detected, physically flatten the depth map inside the mask 
+            # before generating the cross-section chart to reflect true shallow geometry.
+            chart_depth_map = depth_map
+            if pothole.get("illusionWarning"):
+                chart_depth_map = depth_map.copy()
+                road_mean = np.mean(chart_depth_map[mask == 0]) if np.any(mask == 0) else np.mean(chart_depth_map)
+                chart_depth_map = np.where(mask > 0, 
+                                           chart_depth_map * 0.15 + (road_mean * 0.85), 
+                                           chart_depth_map)
+
+            depth_profile = compute_depth_slice(
+                mask, chart_depth_map, water_detected=water_detected, severity=severity, image_gray=image_gray
+            )
+            if depth_profile:
+                pothole["depthProfile"] = depth_profile
+        except Exception:
+            pass  # graceful degradation
+
+        potholes.append(pothole)
+        mask_records.append((mask, pothole))
+
+    # Choose one representative pothole: the most severe, then the largest. It
+    # supplies every image-level field, the module status, and (via
+    # representativeId) the pothole the dashboard's diagnostic panels show.
+    representative = None
+    if potholes:
+        representative = max(
+            potholes,
+            key=lambda p: (
+                severity_rank(str(p["consensusSeverity"])),
+                float(p["features"].get("pothole_area", 0)),
+            ),
+        )
+
+    # ── 5. Build Visualization Images ──
+    img_original = encode_image(original_image)
+
+    overlay_mask = original_image.copy()
+    for mask, pothole in mask_records:
+        severity = str(pothole["consensusSeverity"])
+        color = SEVERITY_COLORS_BGR.get(severity, (255, 255, 255))
+
+        tint = np.zeros_like(original_image)
+        tint[:, :, 0] = color[0]
+        tint[:, :, 1] = color[1]
+        tint[:, :, 2] = color[2]
+        blended = cv2.addWeighted(original_image, 0.45, tint, 0.55, 0)
+        overlay_mask[mask == 1] = blended[mask == 1]
+
+        bbox_obj = pothole.get("bbox")
+        if bbox_obj is not None:
+            bbox = (
+                int(bbox_obj["x1"]),
+                int(bbox_obj["y1"]),
+                int(bbox_obj["x2"]),
+                int(bbox_obj["y2"]),
+            )
+            lines = [
+                f"P{pothole['id']}: {severity}",
+                f"Area: {pothole['features'].get('pothole_area', 0)}",
+                f"Drop: {pothole['features'].get('local_depth_contrast', 0.0):.3f}",
+            ]
+            draw_labeled_bbox(overlay_mask, bbox, lines, box_color=color)
+
+    img_mask = encode_image(overlay_mask)
+
+    depth_norm = cv2.normalize(depth_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    depth_heatmap = cv2.applyColorMap(depth_norm, cv2.COLORMAP_INFERNO)
+    img_depth = encode_image(depth_heatmap)
+
+    # Annotated depth overlay (contours, markers, slice lines)
+    depth_annotated_img = build_depth_annotated_image(
+        original_image, depth_map, mask_records,
+    )
+    img_depth_annotated = encode_image(depth_annotated_img)
+
+    schematic_img = build_schematic_image(original_image.shape, potholes)
+    img_schematic = encode_image(schematic_img)
+
+    if representative is None:
+        consensus_text = "No Pothole"
+        consensus_subtext = "Detected by 1 of 1 classifiers"
+        features = feature_bundle(None)
+        classifications = {"Rule-Based": "No Pothole"}
+        consensus_count = 1
+        total_classifiers = 1
+        bbox = None
+    else:
+        consensus_text = str(representative["consensusSeverity"])
+        pothole_count = len(potholes)
+        consensus_subtext = f"Worst severity among {pothole_count} pothole(s)"
+        features = representative["features"]
+        classifications = representative["classifications"]
+        consensus_count = int(representative["consensusCount"])
+        total_classifiers = int(representative["totalClassifiers"])
+        bbox = representative["bbox"]
+
+    # Detect if any pothole has water
+    has_water_filled = any(
+        p.get("waterAnalysis", {}).get("waterDetected", False)
+        for p in potholes
+    )
+
+    return JSONResponse(
+        {
+            "success": True,
+            "potholeCount": len(potholes),
+            "consensusSeverity": consensus_text,
+            "consensusSubtext": consensus_subtext,
+            "consensusCount": consensus_count,
+            "totalClassifiers": total_classifiers,
+            "features": features,
+            "classifications": classifications,
+            "moduleStatus": _module_status(representative),
+            "potholes": potholes,
+            # The pothole every image-level field above was taken from. The UI
+            # uses it for the per-pothole panels too, so the headline verdict and
+            # the water / temporal / semantic diagnostics describe the same one.
+            "representativeId": representative["id"] if representative else None,
+            # Which signal produced consensusSeverity, and the measured-label
+            # depth estimate behind it when that was the metric model.
+            "severitySource": representative.get("severitySource", "legacy_vote") if representative else None,
+            "metricDepth": representative.get("metricDepth") if representative else None,
+            "images": {
+                "original": img_original,
+                "maskOverlay": img_mask,
+                "depthHeatmap": img_depth,
+                "depthAnnotated": img_depth_annotated,
+                "schematic": img_schematic,
+            },
+            "bbox": bbox,
+            "hasWaterFilledPotholes": has_water_filled,
+        }
+    )
 
 
 @app.get("/insights/summary")

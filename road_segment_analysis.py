@@ -21,7 +21,7 @@ from reportlab.lib.units import inch
 from segmentation import get_all_masks
 from features import extract_features_extended
 from classifier import classify_severity as rule_based_classify
-from inference import get_depth_map, _load_depth_model
+from inference import get_depth_map, _load_depth_model, extract_ml_features
 
 try:
     from temporal_analysis import estimate_pothole_age, predict_severity_progression
@@ -94,16 +94,14 @@ def analyze_segment(images_folder, output_dir):
     
     pixel_size_cm = 0.5
     depth_scale_cm = 50
-    
-    # Feature columns expected by ML models
-    feature_cols = [
-        'height', 'width', 'box_area', 'pothole_area', 'nonpothole_area',
-        'mean_depth', 'max_depth', 'min_depth', 'depth_std', 'depth_range', 'p90_depth',
-        'aspect_ratio', 'solidity', 'compactness', 'depth_skewness',
-        'depth_kurtosis', 'boundary_gradient', 'weighted_mean_depth',
-        'surface_area_px2', 'surface_area_cm2'
-    ]
-    
+
+    # The feature vector must match the scaler's width exactly (11, 20 or 39
+    # columns, in training order). inference.extract_ml_features owns that
+    # contract; a hand-built 20-column vector here silently failed against the
+    # 39-feature scaler and left every report rule-only.
+    expected_features = int(getattr(scaler, 'n_features_in_', 11)) if scaler is not None else 11
+    ml_failures = 0
+
     for img_path in image_paths:
         img_name = os.path.basename(img_path)
         total_images_processed += 1
@@ -143,27 +141,20 @@ def analyze_segment(images_folder, output_dir):
             
             ml_preds = {}
             if ml_models and scaler:
-                # Ensure feature order matches extended features
-                feat_vec = np.zeros(len(feature_cols))
-                for j, col in enumerate(feature_cols):
-                    if col in features:
-                        feat_vec[j] = features[col]
-                    elif col == 'area' and 'pothole_area' in features:
-                        feat_vec[j] = features['pothole_area']
-                        
-                # Ensure it only passes exactly what the model expects
-                # we don't know exactly if the model was trained with extended features, we try our best.
-                # Actually, the model scaler has expected n_features_in_
-                f_in = getattr(scaler, 'n_features_in_', len(feature_cols))
-                feat_array = feat_vec[:f_in].reshape(1, -1)
-                
-                try:
+                feat_array = extract_ml_features(mask, depth_map, expected_features)
+                if feat_array is None:
+                    ml_failures += 1
+                else:
                     X_scaled = scaler.transform(feat_array)
                     for m_name, model in ml_models.items():
-                        pred = int(model.predict(X_scaled)[0])
-                        ml_preds[m_name] = SEVERITY_MAP.get(pred, "Unknown")
-                except Exception as e:
-                    pass
+                        try:
+                            pred = int(model.predict(X_scaled)[0])
+                            ml_preds[m_name] = SEVERITY_MAP.get(pred, "Unknown")
+                        except Exception as e:
+                            # One incompatible pickle must not silence the rest,
+                            # and must not fail invisibly either.
+                            ml_failures += 1
+                            print(f"  !! {m_name} failed on {img_name}#{i}: {type(e).__name__}: {e}")
                     
             all_verdicts = [rule_verdict] + list(ml_preds.values())
             all_verdicts = [v for v in all_verdicts if v in SEVERITY_MAP.values()]
@@ -240,7 +231,9 @@ def analyze_segment(images_folder, output_dir):
             results.append(row)
             
     df_results = pd.DataFrame(results)
-    
+    if ml_failures:
+        print(f"Warning: {ml_failures} ML prediction failure(s); affected potholes used fewer voters.")
+
     max_possible = 3 * total_area_px
     repair_priority_score = (score_numerator / max_possible + 1e-8) * 100 if max_possible > 0 else 0
     priority_score = min(100.0, max(0.0, repair_priority_score))

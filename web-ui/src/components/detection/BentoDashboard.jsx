@@ -40,8 +40,16 @@ export default function BentoDashboard({ results }) {
     );
   }
 
-  // First/representative pothole drives the advanced panels
-  const primaryPothole = results.potholes[0];
+  // The API's representative pothole (most severe, then largest) supplies the
+  // headline verdict, features and agreement. The advanced panels must show the
+  // same pothole, or the verdict and the diagnostics can describe two different
+  // ones on a multi-pothole frame.
+  const primaryPothole =
+    results.potholes.find((p) => p.id === results.representativeId) || results.potholes[0];
+  // The headline comes from the measured-label depth model when it ran; the
+  // legacy vote is then shown for comparison only.
+  const measured = results.severitySource === 'metric';
+  const metric = primaryPothole.metricDepth || null;
 
   const formattedClassifiers = {};
   if (results.classifications) {
@@ -80,9 +88,9 @@ export default function BentoDashboard({ results }) {
         </div>
 
         <InstrumentPanel
-          title="Consensus Severity"
+          title={measured ? 'Severity' : 'Consensus Severity'}
           accent="amber"
-          statusLabel="VERDICT"
+          statusLabel={measured ? 'MEASURED MODEL' : 'VERDICT'}
           flicker={false}
           className="lg:col-span-1"
           bodyClassName="p-6 flex flex-col items-center justify-center text-center h-full"
@@ -93,6 +101,49 @@ export default function BentoDashboard({ results }) {
             total={results.totalClassifiers}
           />
           <p className="mt-4 text-slate-400 text-sm">{results.consensusSubtext}</p>
+          {metric && (
+            <div className="mt-3 w-full font-mono">
+              <p className="text-white text-lg">
+                {metric.depthMm.toFixed(0)} mm
+                <span className="text-slate-500 text-xs"> · likely {metric.lowMm.toFixed(0)}–{metric.highMm.toFixed(0)} mm</span>
+              </p>
+              <p className="mt-1 text-[10px] uppercase tracking-[0.12em] text-slate-500">
+                Estimated bowl depth · 80% of held-out potholes within ±{metric.intervalMm.toFixed(0)} mm
+                {metric.readFrom === 'close-up' && ' · small in the photo, read from a close-up'}
+              </p>
+              {metric.inDistribution === false && (
+                <p
+                  className="mt-2 text-[10px] uppercase tracking-[0.12em] text-amber-400 leading-relaxed"
+                  title={`Outside the training range: ${(metric.outOfRange || []).join(', ')}`}
+                >
+                  Photo unlike the measured training set · estimate is an extrapolation
+                  {(metric.outOfRange || []).includes('mf_cam_dist_mm') && metric.trainedCameraRangeMm?.length === 2 && (
+                    <span className="block text-slate-400 normal-case tracking-normal mt-1">
+                      Camera looks {metric.cameraFurtherThanTraining ? 'further from' : 'closer to'} the road
+                      than in the measured photos, which were taken{' '}
+                      {(metric.trainedCameraRangeMm[0] / 1000).toFixed(1)}–
+                      {(metric.trainedCameraRangeMm[1] / 1000).toFixed(1)} m away, looking down.
+                    </span>
+                  )}
+                </p>
+              )}
+            </div>
+          )}
+          {measured && primaryPothole.legacyVote && primaryPothole.legacyVote !== results.consensusSeverity && (
+            <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-400">
+              Legacy pseudo-label vote said {primaryPothole.legacyVote}
+            </p>
+          )}
+          {primaryPothole.semanticSuggestion && (
+            <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.12em] text-slate-500">
+              DINOv2 suggested {primaryPothole.semanticSuggestion} · advisory, not applied
+            </p>
+          )}
+          {primaryPothole.votedSeverity && (
+            <p className="mt-2 font-mono text-[10px] uppercase tracking-[0.12em] text-amber-400">
+              Semantic override · classifiers voted {primaryPothole.votedSeverity}
+            </p>
+          )}
 
           <div className="w-full h-px bg-slate-700/70 my-5" />
 

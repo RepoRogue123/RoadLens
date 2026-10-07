@@ -45,8 +45,6 @@ TRIPLET_GLOB = "data1/train/images/pic-100-*.jpg"
 DIST_GLOB = "data1/train/images/pic-1*.jpg"
 DIST_LIMIT = 18
 
-PATCH = 14
-
 
 def analyze(path):
     masks = get_all_masks(path)
@@ -60,11 +58,11 @@ def analyze(path):
         return None
     iv = feats["dinov2_inside_variance"]
     ov = feats["dinov2_outside_variance"]
-    small = cv2.resize(mask.astype(np.uint8), (PATCH, PATCH), interpolation=cv2.INTER_AREA)
     return {
         "rgb": rgb, "mask": mask, "inside": iv, "outside": ov,
         "ratio": iv / ov if ov > 1e-9 else float("nan"),
-        "patches": int((small > 0).sum()),
+        # From the extractor, which uses the model's real (cropped 16x16) grid.
+        "patches": int(feats.get("dinov2_patch_count", 0)),
         "name": os.path.basename(path),
     }
 

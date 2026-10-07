@@ -1,8 +1,11 @@
-import { BrainCircuit, SunDim } from 'lucide-react';
+import { BrainCircuit, Mountain } from 'lucide-react';
+
+/** Normal deviation is reported in degrees; this is the gauge's full-scale value. */
+const NORMAL_DEVIATION_FULL_SCALE_DEG = 45;
 import InstrumentPanel from '../instrument/InstrumentPanel';
 
 /** Semicircular arc gauge with a mono value — instrument dial. */
-function ArcGauge({ label, value, max = 1.0, color = '#a78bfa' }) {
+function ArcGauge({ label, value, max = 1.0, color = '#a78bfa', format = (v) => v.toFixed(4) }) {
   const pct = Math.max(0, Math.min(value / max, 1));
   const R = 34;
   const C = Math.PI * R; // semicircle length
@@ -33,7 +36,7 @@ function ArcGauge({ label, value, max = 1.0, color = '#a78bfa' }) {
       <div className="min-w-0">
         <p className="font-mono text-[10px] uppercase tracking-[0.14em] text-slate-500">{label}</p>
         <p className="font-mono text-lg font-semibold" style={{ color }}>
-          {value.toFixed(4)}
+          {format(value)}
         </p>
       </div>
     </div>
@@ -44,13 +47,17 @@ export default function SemanticIntelligence({ geometryAnalysis }) {
   if (!geometryAnalysis) return null;
 
   const { foundationFeatures, curvatureFeatures } = geometryAnalysis;
-  const sfsAnomaly = curvatureFeatures?.mean_normal_deviation || 0;
+  // Mean angle (degrees) between surface normals on the boundary ring and the
+  // road's reference normal, from features.extract_surface_normal_features.
+  // Normals are Sobel derivatives of the monocular depth map — this is NOT
+  // shape-from-shading, and it inherits the depth model's failures.
+  const normalDeviationDeg = curvatureFeatures?.mean_normal_deviation || 0;
 
   return (
     <InstrumentPanel
       title="Semantic Verification"
       accent="holo"
-      statusLabel="DINOV2 · SFS"
+      statusLabel="DINOV2 · NORMALS"
       bodyClassName="p-4 sm:p-5"
       flicker={false}
     >
@@ -88,25 +95,27 @@ export default function SemanticIntelligence({ geometryAnalysis }) {
           </div>
         </div>
 
-        {/* Shape from Shading */}
+        {/* Boundary surface normals */}
         <div>
           <div className="flex items-center gap-2 mb-4">
             <div className="p-1.5 rounded-[2px] bg-holo-teal/10 border border-holo-teal/30">
-              <SunDim className="w-4 h-4 text-holo-teal-bright" />
+              <Mountain className="w-4 h-4 text-holo-teal-bright" />
             </div>
-            <h3 className="text-sm font-semibold text-slate-300">Shape-from-shading — wall steepness</h3>
+            <h3 className="text-sm font-semibold text-slate-300">Surface normals — wall steepness</h3>
           </div>
 
           <div className="bg-slate-950/60 rounded-[2px] p-4 border border-slate-700 min-h-[150px]">
             <ArcGauge
-              label="Surface normal anomaly"
-              value={sfsAnomaly}
-              max={1.0}
+              label="Boundary normal deviation"
+              value={normalDeviationDeg}
+              max={NORMAL_DEVIATION_FULL_SCALE_DEG}
               color="#5eead4"
+              format={(v) => `${v.toFixed(1)}°`}
             />
             <p className="mt-4 text-xs text-slate-500 leading-relaxed">
-              Steep lighting gradients and deviant surface normals mark real cavity walls —
-              a depth witness that ignores 2D shadows entirely.
+              Mean tilt of the surface around the rim relative to the road, derived from the
+              monocular depth map. Steeper walls read higher; a flat stain reads near zero only
+              if the depth model also sees it as flat.
             </p>
           </div>
         </div>

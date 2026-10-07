@@ -1,3 +1,4 @@
+# --- API and inference ---
 fastapi
 uvicorn[standard]
 python-multipart
@@ -6,8 +7,23 @@ opencv-python-headless
 scipy
 scikit-learn
 joblib
+pandas
 matplotlib
 torch
 torchvision
 ultralytics
+transformers
 dill
+# the legacy classifier vote unpickles these models
+lightgbm
+xgboost
+
+# --- training and evaluation scripts ---
+tqdm
+requests
+
+# --- optional ---
+# MoGe-3 geometry: out-of-range photo check and the fallback depth regressor
+#   pip install git+https://github.com/microsoft/MoGe.git
+# SAM 2: box-to-outline conversion (scripts/boxes_to_polygons.py)
+#   pip install git+https://github.com/facebookresearch/sam2.git

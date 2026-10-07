@@ -30,6 +30,7 @@ Usage:
 """
 import argparse
 import csv
+import hashlib
 import datetime
 import glob
 import json
@@ -45,6 +46,7 @@ import matplotlib.pyplot as plt
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_DIR)
 
+from scripts.annotate_pack import mask_from_polygon           # noqa: E402
 from segmentation import get_all_masks                        # noqa: E402
 from foundation_features import extract_foundation_features   # noqa: E402
 import semantic_config                                        # noqa: E402
@@ -79,8 +81,13 @@ def compute_features(rows):
     out, computed = [], 0
     for i, row in enumerate(rows, 1):
         name = row["image"]
-        if name in cache:
-            c = cache[name]
+        # A frozen outline (merge_annotations.py) is part of the cache key: the same photo
+        # scored with a different mask is a different measurement.
+        key = (f"{name}|{hashlib.md5(row['polygon'].encode()).hexdigest()[:8]}"
+               if row.get("polygon") else name)
+        row["cache_key"] = key
+        if key in cache:
+            c = cache[key]
             try:
                 row["ratio"] = float(c["ratio"])
                 row["patches"] = int(c["patches"])
@@ -95,11 +102,15 @@ def compute_features(rows):
             print(f"  ! image not found, skipping: {name}")
             continue
         try:
-            masks = get_all_masks(path)
-            if not masks:
-                continue
             img = cv2.imread(path)
-            feats = extract_foundation_features(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), masks[0])
+            if row.get("polygon"):
+                mask = mask_from_polygon(row["polygon"], *img.shape[:2])
+            else:
+                masks = get_all_masks(path)
+                if not masks:
+                    continue
+                mask = masks[0]
+            feats = extract_foundation_features(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), mask)
             if not feats:
                 continue
             iv = feats["dinov2_inside_variance"]
@@ -118,7 +129,7 @@ def compute_features(rows):
         w = csv.DictWriter(f, fieldnames=["image", "ratio", "ratio_raw", "patches"])
         w.writeheader()
         for r in out:
-            w.writerow({k: r.get(k, "") for k in w.fieldnames})
+            w.writerow({**{k: r.get(k, "") for k in w.fieldnames}, "image": r.get("cache_key", r["image"])})
     return out
 
 
@@ -276,15 +287,29 @@ def main():
         "stratum": args.stratum,
         "fitted_at": datetime.date.today().isoformat(),
     }
-    with open(os.path.join(OUT_DIR, "threshold.json"), "w", encoding="utf-8") as f:
+    # Only a fit worth trusting becomes the calibration the app loads. semantic_config reads
+    # threshold.json at import and then reports the override as CALIBRATED, so a fit on too
+    # few examples, or one that does not separate the classes, must never land there.
+    trusted = (int(is_ill.sum()) >= MIN_ILLUSIONS and int((~is_ill).sum()) >= MIN_ILLUSIONS
+               and auc_val >= 0.6)
+    name = "threshold.json" if trusted else "threshold_indicative.json"
+    payload["trusted"] = trusted
+    stale = os.path.join(OUT_DIR, "threshold.json")
+    if not trusted and os.path.exists(stale):
+        os.remove(stale)             # an older trusted fit must not outlive the labels it came from
+    with open(os.path.join(OUT_DIR, name), "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2)
     with open(os.path.join(OUT_DIR, "sweep.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(swept[0].keys()))
         w.writeheader()
         w.writerows(swept)
 
-    print(f"\n  wrote {os.path.relpath(OUT_DIR, PROJECT_DIR)}/threshold.json")
-    print("  semantic_config.py will now pick this up automatically.")
+    print(f"\n  wrote {os.path.relpath(OUT_DIR, PROJECT_DIR)}/{name}")
+    if trusted:
+        print("  semantic_config.py will now pick this up automatically.")
+    else:
+        print(f"  NOT applied: needs >= {MIN_ILLUSIONS} of each class and AUC >= 0.6. "
+              "The app stays on its uncalibrated defaults.")
 
 
 if __name__ == "__main__":

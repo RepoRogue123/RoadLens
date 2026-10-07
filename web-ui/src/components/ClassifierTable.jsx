@@ -18,6 +18,7 @@ export default function ClassifierTable({ results, consensus }) {
         const token = severityToken(result.severity);
         const matches = normalizeSeverity(result.severity) === consensusKey;
         const isRule = cls.type === 'rule';
+        const isMeasured = cls.type === 'measured';
 
         return (
           <div
@@ -40,6 +41,11 @@ export default function ClassifierTable({ results, consensus }) {
               {isRule && (
                 <span className="font-mono text-[9px] px-1.5 py-0.5 rounded-[2px] bg-cyan-500/10 text-cyan-400 border border-cyan-500/25 tracking-[0.1em] shrink-0">
                   THRESHOLD
+                </span>
+              )}
+              {isMeasured && (
+                <span className="font-mono text-[9px] px-1.5 py-0.5 rounded-[2px] bg-green-500/10 text-green-400 border border-green-500/25 tracking-[0.1em] shrink-0">
+                  MEASURED
                 </span>
               )}
             </div>
@@ -70,9 +76,11 @@ export default function ClassifierTable({ results, consensus }) {
             {/* Hover note */}
             {hoveredRow === cls.id && (
               <div className="absolute -top-8 left-1/2 -translate-x-1/2 z-10 px-3 py-1.5 rounded-[2px] bg-slate-800 border border-slate-600 font-mono text-[10px] text-slate-300 whitespace-nowrap shadow-xl">
-                {isRule
-                  ? 'Hand-set thresholds on relative depth contrast'
-                  : 'Trained on clustered severity labels'}
+                {isMeasured
+                  ? 'Trained on 1,051 potholes with RealSense-measured depth'
+                  : isRule
+                    ? 'Hand-set thresholds on relative depth contrast'
+                    : 'Trained on clustered pseudo-labels, not measurement'}
               </div>
             )}
           </div>

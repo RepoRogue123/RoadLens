@@ -87,43 +87,50 @@ def label_severity_from_area_ratio(mask, image_shape):
 #  Feature Extraction Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def extract_depth_feature_set(image_bgr, mask, depth_map):
-    """Extract depth-based features (original 11-12 feature pipeline)."""
-    try:
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        feats = extract_depth_features(gray, mask, depth_map)
-        if feats:
-            return np.array([feats.get(k, 0) for k in sorted(feats.keys())])
-    except Exception:
-        pass
-    return None
+#  Every extractor below must see a depth map computed from the image it is
+#  scoring. The original version loaded one precomputed map from the CLEAN
+#  image and reused it for every adverse variant, and called
+#  extract_depth_features(gray, mask, depth) against a (mask, depth) signature;
+#  the resulting TypeError was swallowed, so depth and combined sets were always
+#  None. The saved CSV showed one constant prediction per classifier at 100%
+#  "consistency" — an artefact, not robustness. Failures are now raised.
+
+_DEPTH_FN = None
+
+
+def depth_for(image_bgr):
+    """Depth-Anything-V2 depth for exactly this image (lazy-loaded once)."""
+    global _DEPTH_FN
+    if _DEPTH_FN is None:
+        from inference import get_depth_map
+        _DEPTH_FN = get_depth_map
+    return _DEPTH_FN(image_bgr)
+
+
+def extract_depth_feature_set(mask, depth_map):
+    """Depth-statistics features, as the rule classifier consumes them."""
+    feats = extract_depth_features(mask, depth_map)
+    if not feats:
+        return None
+    return np.array([feats.get(k, 0) for k in sorted(feats.keys())], dtype=float)
 
 
 def extract_geometry_feature_set(mask, depth_map):
-    """Extract geometry-only features (curvature + depth profile + normals)."""
-    try:
-        feats = extract_all_geometry_features(mask, depth_map)
-        if feats:
-            return np.array([feats.get(k, 0) for k in sorted(feats.keys())])
-    except Exception:
-        pass
-    return None
+    """Geometry features (curvature + road-relative bowl depth + normals)."""
+    feats = extract_all_geometry_features(mask, depth_map)
+    if not feats:
+        return None
+    return np.array([feats.get(k, 0) for k in sorted(feats.keys())], dtype=float)
 
 
-def extract_combined_feature_set(image_bgr, mask, depth_map):
-    """Extract all features combined."""
-    try:
-        gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-        depth_feats = extract_depth_features(gray, mask, depth_map)
-        geom_feats = extract_all_geometry_features(mask, depth_map)
-        if depth_feats and geom_feats:
-            combined = {}
-            combined.update(depth_feats)
-            combined.update(geom_feats)
-            return np.array([combined.get(k, 0) for k in sorted(combined.keys())])
-    except Exception:
-        pass
-    return None
+def extract_combined_feature_set(mask, depth_map):
+    """Depth statistics and geometry together."""
+    depth_feats = extract_depth_features(mask, depth_map)
+    geom_feats = extract_all_geometry_features(mask, depth_map)
+    if not (depth_feats and geom_feats):
+        return None
+    combined = {**depth_feats, **geom_feats}
+    return np.array([combined.get(k, 0) for k in sorted(combined.keys())], dtype=float)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -206,17 +213,12 @@ def run_evaluation(max_images=50):
         # Skip if missing components
         if not os.path.exists(lbl_path):
             continue
-        if not os.path.exists(depth_path):
-            continue
 
         try:
             img_bgr = cv2.imread(img_path)
             if img_bgr is None:
                 continue
             h, w = img_bgr.shape[:2]
-            depth_map = np.load(depth_path)
-            if depth_map.shape != (h, w):
-                depth_map = cv2.resize(depth_map, (w, h))
 
             masks = parse_label_file(lbl_path, h, w)
             if not masks:
@@ -228,9 +230,12 @@ def run_evaluation(max_images=50):
                 continue
 
             # ── Original predictions ──
-            orig_depth_feats = extract_depth_feature_set(img_bgr, mask, depth_map)
+            # Depth is recomputed live rather than read from depth_maps_*, so the
+            # clean and adverse images go through the identical depth pipeline.
+            depth_map = depth_for(img_bgr)
+            orig_depth_feats = extract_depth_feature_set(mask, depth_map)
             orig_geom_feats = extract_geometry_feature_set(mask, depth_map)
-            orig_combined_feats = extract_combined_feature_set(img_bgr, mask, depth_map)
+            orig_combined_feats = extract_combined_feature_set(mask, depth_map)
 
             orig_preds = {
                 'depth_based': predict_severity_from_features(orig_depth_feats),
@@ -249,11 +254,14 @@ def run_evaluation(max_images=50):
                     else:
                         adverse_img = synthesize_condition(img_bgr, condition, seed=42)
 
-                    # Re-extract features on adverse image
-                    # Note: geometry features from mask are UNCHANGED (key hypothesis!)
-                    adv_depth_feats = extract_depth_feature_set(adverse_img, mask, depth_map)
-                    adv_geom_feats = extract_geometry_feature_set(mask, depth_map)
-                    adv_combined_feats = extract_combined_feature_set(adverse_img, mask, depth_map)
+                    # Re-extract features on the adverse image, with depth
+                    # re-estimated FROM that image. The mask stays the labelled
+                    # polygon, so curvature is unchanged by construction; the
+                    # depth-derived bowl and normal features are not.
+                    adv_depth_map = depth_for(adverse_img)
+                    adv_depth_feats = extract_depth_feature_set(mask, adv_depth_map)
+                    adv_geom_feats = extract_geometry_feature_set(mask, adv_depth_map)
+                    adv_combined_feats = extract_combined_feature_set(mask, adv_depth_map)
 
                     adv_preds = {
                         'depth_based': predict_severity_from_features(adv_depth_feats),

@@ -1,0 +1,64 @@
+{
+  "fitted": "2026-10-07",
+  "weights_from": [
+    "archive/relief_runs/vits_v8/best.pth",
+    "archive/relief_runs/vits_v3/best.pth"
+  ],
+  "target": "p90 relief below the ring-fitted road plane, mm (PothRGBD RealSense)",
+  "decision_thresholds_mm": {
+    "moderate_from": 22.5,
+    "deep_from": 48.0,
+    "chosen_on": "298 held-out potholes (val + test sessions, segmenter outlines)"
+  },
+  "abs_error_q80_mm": 13.25848348585749,
+  "abs_error_q90_mm": 17.829086947175025,
+  "test_yolo": {
+    "mae": 8.272848749282778,
+    "r": 0.730852067422885,
+    "within10": 0.7014925373134329,
+    "cutoffs": [
+      22.5,
+      48.0
+    ],
+    "cost": 0.5096153846153846,
+    "correct": 0.6875,
+    "under_or_missed": 27,
+    "deep_found": 19,
+    "n_deep": 29,
+    "n": 208
+  },
+  "test_human": {
+    "mae": 7.976754092894573,
+    "r": 0.7557583397889261,
+    "within10": 0.7115384615384616,
+    "cutoffs": [
+      20.0,
+      44.0
+    ],
+    "cost": 0.6105769230769231,
+    "correct": 0.6298076923076923,
+    "under_or_missed": 22,
+    "deep_found": 18,
+    "n_deep": 29,
+    "n": 208
+  },
+  "baseline_regressor_test_yolo": {
+    "mae": 11.049219584978323,
+    "r": 0.5922377318606864,
+    "within10": 0.5621890547263682,
+    "cutoffs": [
+      5.0,
+      48.5
+    ],
+    "cost": 0.7307692307692307,
+    "correct": 0.46153846153846156,
+    "under_or_missed": 30,
+    "deep_found": 6,
+    "n_deep": 29,
+    "n": 208
+  },
+  "caveats": [
+    "Trained and tested on one camera (RealSense D415), one operator, close range, looking down.",
+    "No measured depth exists for any other kind of photo; behaviour there is unverified."
+  ]
+}

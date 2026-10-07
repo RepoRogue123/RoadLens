@@ -97,21 +97,66 @@ DEFAULT_CORRECTIONS = {
 DEFAULT_APPLY_CORRECTIONS = True
 
 # ── Cue 7 / cue 8 rollout gates ──────────────────────────────────────────
-# Both default OFF in the live API. They are implemented, wired and verified to
-# run, but neither has been evaluated against a labelled water set — cue 8's
-# response curve in particular is a scale read off 13 regions, not a fitted
-# boundary. Turning an unvalidated cue on in production is exactly the mistake
-# that left the base ensemble tuned to four images.
+# Cue 7 (CLIPSeg) is ON. The HanYang evaluation earned it: fitted on the
+# 2,119-image train split and tested on the disjoint 300, the calibrated
+# ensemble cut missed water from 244 to 83 of 442, and `semantic` carries the
+# largest coefficient. The shipped water_params.json is the 6-cue fit that
+# REQUIRES this cue — with it off, detect_water must refuse the calibration and
+# fall back to the hand-set configuration, so the measured numbers would
+# describe a model the API never runs.
+#
+# Cue 8 (Intrinsic) stays OFF. Dropping it cost 7 extra misses out of 442 for a
+# 16x speed-up, and its licence is academic-only. The 7-cue calibration is kept
+# at water_params_7cue_backup.json for offline batch analysis.
 #
 # scripts/eval_water_puddle1000.py passes the maps in explicitly regardless of
-# these flags, so evaluation is unaffected by them. Flip these to True only
-# once Puddle-1000 says they earn their weight.
+# these flags, so evaluation is unaffected by them. Where CLIPSeg cannot be
+# imported (e.g. a container without `transformers`), the cue abstains and
+# detect_water reports combination="legacy_fallback_missing_cues".
 #
-# Cost when enabled: one CLIPSeg forward pass and one intrinsic decomposition
-# per IMAGE (not per pothole) — roughly 0.2 s and 2-4 s respectively on the
-# 4070, so cue 8 in particular is not free at request time.
-ENABLE_SEMANTIC_CUE = False
+# Cost when enabled: one forward pass per IMAGE (not per pothole) — roughly
+# 0.2 s for CLIPSeg and 2-4 s for Intrinsic on the 4070.
+ENABLE_SEMANTIC_CUE = True
 ENABLE_RESIDUAL_CUE = False
+
+# ── Learned water segmenter (DECIDES since 2026-10-02, on human labels) ──────
+# A YOLOv8n-seg trained on HanYang puddle outlines (scripts/train_water_yolo.py).
+# On the held-out HanYang valid split — the same 707 regions the logistic model
+# was scored on — it reaches precision 0.998 / recall 0.925 (33 missed water
+# regions, 1 false alarm) against 0.924 / 0.796 (90 missed, 29 false) for the
+# served 6-cue logistic. It also needs no `transformers`, so unlike CLIPSeg it
+# runs in the deployed container.
+#
+# On PothRGBD potholes, which are mostly dry, both detectors flag the same share
+# (17 of 173) and by eye most flags are dry, brown, dirt-filled potholes: HanYang
+# puddles are often muddy brown. There are no pothole-water labels, so that rate
+# is not measured, only inspected. Water never changes severity.
+#
+# HanYang regions ARE water outlines, but in the pipeline the region is the
+# POTHOLE outline and water often fills only its centre, so the "> 50%" rule that
+# worked on HanYang misses partly filled potholes. The rule for potholes was
+# settled on 142 hand-labelled potholes (53 water, 89 dry; three labellers, two
+# per pothole, kappa 0.70, disputes resolved by review; packs/water_v1,
+# scripts/eval_pothole_water.py), under a switching rule written before labelling:
+#
+#                                   missed water   false alarms
+#     cue ensemble (6-cue logistic)       22             11
+#     segmenter, cross-fitted             13             15      <- the honest estimate
+#     segmenter, coverage > 0.1           11             15      <- served; in-sample
+#
+# Known cost: on dry, dirt-filled potholes (PothRGBD: 4 water of 45) it raises 9
+# false alarms against the ensemble's 5 — it reads brown soil as muddy water.
+# Water never changes severity; it only raises the hazard flag.
+# The ensemble still runs and is reported as `ensemble_probability`.
+ENABLE_WATER_SEGMENTER = True           # run it and report coverage
+WATER_SEGMENTER_DECIDES = True          # False restores the cue ensemble as the decision
+WATER_SEGMENTER_WEIGHTS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "yolo-segmentation", "model", "water_best.pt")
+WATER_SEGMENTER_CONF = 0.25
+WATER_COVERAGE_THRESHOLD = 0.1          # share of the pothole outline marked as water
+# How MUCH of the pothole is covered, not how sure the call is: precision was flat
+# (0.73-0.75) across thresholds from 0.1 to 0.5 on the labelled potholes.
+WATER_COVERAGE_BANDS = {"high": 0.5, "medium": 0.3, "low": 0.1}
 
 
 def _load() -> Dict[str, Any]:

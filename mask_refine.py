@@ -172,6 +172,38 @@ def refine_mask(image_rgb: np.ndarray, coarse_mask: np.ndarray) -> np.ndarray:
     return refined
 
 
+def masks_from_boxes(image_rgb: np.ndarray, boxes, centre_point: bool = False):
+    """
+    One SAM 2 mask per box (x0, y0, x1, y1), for turning box labels into outlines.
+
+    Returns a list as long as `boxes`: a binary uint8 mask, or None where SAM 2 failed.
+    No safety gate here — there is no coarse mask to compare with; the caller judges the
+    result against the box (scripts/boxes_to_polygons.py). `centre_point` adds the box
+    centre as a positive click.
+    """
+    predictor = _load_sam2()
+    if predictor is None:
+        return [None] * len(boxes)
+    out = []
+    try:
+        with torch.inference_mode():
+            predictor.set_image(image_rgb)
+            for b in boxes:
+                b = np.asarray(b, dtype=np.float32)
+                kw = {}
+                if centre_point:
+                    kw = {"point_coords": np.array([[(b[0] + b[2]) / 2, (b[1] + b[3]) / 2]], dtype=np.float32),
+                          "point_labels": np.array([1], dtype=np.int32)}
+                masks, scores, _ = predictor.predict(box=b[None, :], multimask_output=False, **kw)
+                m = np.asarray(masks)
+                m = m.reshape(-1, *m.shape[-2:])[int(np.argmax(np.asarray(scores).ravel()))]
+                out.append((m > 0).astype(np.uint8))
+    except Exception as e:
+        print(f"  !! SAM 2 box prompt failed: {type(e).__name__}: {str(e)[:100]}")
+        out += [None] * (len(boxes) - len(out))
+    return out
+
+
 def stats() -> dict:
     """Refinement counters — how often the safety gate actually fires."""
     return dict(_STATS)

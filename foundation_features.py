@@ -139,6 +139,49 @@ def _size_matched_variance(features, k: int) -> float:
     return float(np.median(vals))
 
 
+def _size_field(size_obj: Any, key: str) -> Optional[int]:
+    """Read one field from a processor size config (dict or SizeDict)."""
+    if size_obj is None:
+        return None
+    try:
+        value = size_obj[key]
+    except (KeyError, TypeError):
+        value = getattr(size_obj, key, None)
+    return int(value) if value is not None else None
+
+
+def _mask_in_model_frame(mask: np.ndarray, processor: Any) -> np.ndarray:
+    """
+    Apply the processor's own geometric transform to the mask.
+
+    The DINOv2 processor resizes the SHORTEST edge (256) and then centre-crops
+    224x224, so the patch tokens only cover the central crop of the frame. The
+    mask has to go through the identical resize + crop before it is reduced to
+    the patch grid; resizing the full uncropped mask straight to the grid
+    shifts inside/outside patches relative to the embeddings on any non-square
+    photo, and counts regions the model never saw.
+    """
+    m = mask.astype(np.float32)
+    h, w = m.shape[:2]
+
+    shortest = _size_field(getattr(processor, "size", None), "shortest_edge")
+    if shortest:
+        scale = shortest / float(min(h, w))
+        # Same rounding as transformers' get_resize_output_image_size.
+        new_h, new_w = (shortest, int(shortest * w / h)) if h <= w else (int(shortest * h / w), shortest)
+        m = cv2.resize(m, (new_w, new_h), interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR)
+
+    if getattr(processor, "do_center_crop", False):
+        crop = getattr(processor, "crop_size", None)
+        ch, cw = _size_field(crop, "height"), _size_field(crop, "width")
+        if ch and cw:
+            H, W = m.shape[:2]
+            top = max(0, (H - ch) // 2)
+            left = max(0, (W - cw) // 2)
+            m = m[top:top + ch, left:left + cw]
+    return m
+
+
 def extract_foundation_features(
     image_rgb: np.ndarray,
     mask: np.ndarray,
@@ -172,7 +215,8 @@ def extract_foundation_features(
 
     try:
         # ── Prepare input ──
-        # DINOv2-base uses 224×224 input with 14×14 patch grid (16px patches)
+        # The DINOv2 processor resizes the shortest edge to 256 and centre-crops
+        # 224×224; with 14-px patches that is a 16×16 grid (256 patch tokens).
         inputs = processor(images=image_rgb, return_tensors="pt")
         device = next(model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -186,7 +230,7 @@ def extract_foundation_features(
         patch_features = outputs.last_hidden_state[0, 1:, :]  # (N_patches, 768)
 
         # ── Map patches to spatial grid ──
-        # DINOv2-base: 14×14 = 196 patch tokens for 224×224 input
+        # DINOv2-base: 16×16 = 256 patch tokens for the 224×224 crop
         num_patches = patch_features.shape[0]
         grid_size = int(num_patches ** 0.5)
         if grid_size * grid_size != num_patches:
@@ -196,9 +240,10 @@ def extract_foundation_features(
         # Reshape to spatial grid: (grid_size, grid_size, 768)
         patch_grid = patch_features.reshape(grid_size, grid_size, -1)
 
-        # ── Resize mask to patch resolution ──
+        # ── Map the mask into the model's frame, then to patch resolution ──
+        mask_model = _mask_in_model_frame(mask, processor)
         mask_resized = cv2.resize(
-            mask.astype(np.float32),
+            mask_model,
             (grid_size, grid_size),
             interpolation=cv2.INTER_AREA,
         )
