@@ -1,0 +1,44 @@
+[
+  {
+    "pothole_id": 1,
+    "depth_mm": 6.2,
+    "interval_mm": 14.2,
+    "diameter_mm": 1618.0,
+    "camera_dist_mm": 1924.0,
+    "water_detected": false,
+    "water_coverage": 0.0,
+    "method1_astm_d6433": {
+      "severity": "Moderate",
+      "depth_band": "Shallow",
+      "diameter_band": "Large",
+      "depth_mm": 6.2,
+      "diameter_mm": 1618.0,
+      "cell_coords": [
+        0,
+        2
+      ],
+      "rationale": "Promoted to Moderate: Shallow depth (6.2 mm) spans a wide 1618 mm impact zone."
+    },
+    "method2_two_tier": {
+      "tier1_physical_class": "Moderate",
+      "tier2_priority": "Priority 2 (Scheduled)",
+      "dispatch_window": "Within 7 - 14 Days",
+      "badge_color": "#f59e0b",
+      "priority_reasons": [
+        "Moderate structural defect on dry pavement; standard maintenance queue"
+      ]
+    },
+    "method3_road_hazard_score": {
+      "rhs_score": 31.4,
+      "risk_level": "Low Risk",
+      "risk_color": "#10b981",
+      "effective_depth_mm": 6.2,
+      "breakdown": {
+        "geometry_pts": 24.1,
+        "water_uncertainty_pts": 0.0,
+        "progression_pts": 7.3,
+        "illusion_penalty_pts": 0.0
+      }
+    }
+  }
+]

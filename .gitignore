@@ -236,7 +236,9 @@ depth_maps_1/
 depth_maps_global/
 depth_maps_merged/
 depth_global_stats.npy
-
+RSRD-dense/
+datasets/
+tests/ml_results
 # Local deployment notes
 DEPLOYMENT.md
 deployment.md

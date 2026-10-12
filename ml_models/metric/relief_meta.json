@@ -1,59 +1,58 @@
 {
-  "fitted": "2026-10-07",
+  "fitted": "2026-10-08",
   "weights_from": [
-    "archive/relief_runs/vits_v8/best.pth",
     "archive/relief_runs/vits_v3/best.pth"
   ],
   "target": "p90 relief below the ring-fitted road plane, mm (PothRGBD RealSense)",
   "decision_thresholds_mm": {
-    "moderate_from": 22.5,
-    "deep_from": 48.0,
+    "moderate_from": 20.5,
+    "deep_from": 41.0,
     "chosen_on": "298 held-out potholes (val + test sessions, segmenter outlines)"
   },
-  "abs_error_q80_mm": 13.25848348585749,
-  "abs_error_q90_mm": 17.829086947175025,
+  "abs_error_q80_mm": 14.160892123652758,
+  "abs_error_q90_mm": 20.251177009596773,
   "test_yolo": {
-    "mae": 8.272848749282778,
-    "r": 0.730852067422885,
-    "within10": 0.7014925373134329,
+    "mae": 9.408096397164021,
+    "r": 0.6495423161565695,
+    "within10": 0.6666666666666666,
     "cutoffs": [
       22.5,
-      48.0
+      45.0
     ],
-    "cost": 0.5096153846153846,
-    "correct": 0.6875,
-    "under_or_missed": 27,
-    "deep_found": 19,
+    "cost": 0.7019230769230769,
+    "correct": 0.625,
+    "under_or_missed": 39,
+    "deep_found": 14,
     "n_deep": 29,
     "n": 208
   },
   "test_human": {
-    "mae": 7.976754092894573,
-    "r": 0.7557583397889261,
-    "within10": 0.7115384615384616,
+    "mae": 9.231561079549692,
+    "r": 0.6742996053022319,
+    "within10": 0.6778846153846154,
     "cutoffs": [
-      20.0,
-      44.0
+      23.0,
+      41.5
     ],
-    "cost": 0.6105769230769231,
-    "correct": 0.6298076923076923,
-    "under_or_missed": 22,
-    "deep_found": 18,
+    "cost": 0.7259615384615384,
+    "correct": 0.6586538461538461,
+    "under_or_missed": 34,
+    "deep_found": 16,
     "n_deep": 29,
     "n": 208
   },
   "baseline_regressor_test_yolo": {
-    "mae": 11.049219584978323,
-    "r": 0.5922377318606864,
-    "within10": 0.5621890547263682,
+    "mae": 10.994926660841411,
+    "r": 0.5766582493534949,
+    "within10": 0.572139303482587,
     "cutoffs": [
-      5.0,
-      48.5
+      20.0,
+      49.0
     ],
-    "cost": 0.7307692307692307,
-    "correct": 0.46153846153846156,
-    "under_or_missed": 30,
-    "deep_found": 6,
+    "cost": 0.7019230769230769,
+    "correct": 0.5673076923076923,
+    "under_or_missed": 37,
+    "deep_found": 9,
     "n_deep": 29,
     "n": 208
   },

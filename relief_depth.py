@@ -32,7 +32,21 @@ import numpy as np
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(PROJECT_DIR, "ml_models", "metric")
 META_PATH = os.path.join(MODEL_DIR, "relief_meta.json")
-BASE_CKPT = os.path.join(PROJECT_DIR, "Depth-Anything-V2", "checkpoints", "depth_anything_v2_vits.pth")
+
+
+def _resolve_depth_anything_root() -> str:
+    candidates = [
+        os.path.join(PROJECT_DIR, "Depth-Anything-V2"),
+        os.path.abspath(os.path.join(PROJECT_DIR, "..", "Depth-Anything-V2")),
+    ]
+    for path in candidates:
+        if os.path.isdir(path):
+            return path
+    return candidates[0]
+
+
+DEPTH_ANYTHING_ROOT = _resolve_depth_anything_root()
+BASE_CKPT = os.path.join(DEPTH_ANYTHING_ROOT, "checkpoints", "depth_anything_v2_vits.pth")
 
 LONG_SIDE = 518                  # 37 patches of 14 px; a 640x480 PothRGBD frame becomes 518x392
 IN_W, IN_H = 518, 392            # the fixed training size (PothRGBD's 4:3)
@@ -65,7 +79,7 @@ def build_model(weights: Optional[str] = None):
     """DA-V2 ViT-S with a signed linear output. `weights=None` starts from the DA-V2 checkpoint."""
     import torch
     import torch.nn as nn
-    root = os.path.join(PROJECT_DIR, "Depth-Anything-V2")
+    root = DEPTH_ANYTHING_ROOT
     if root not in sys.path:
         sys.path.append(root)
     from depth_anything_v2.dpt import DepthAnythingV2

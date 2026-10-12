@@ -1,0 +1,45 @@
+[
+  {
+    "pothole_id": 1,
+    "depth_mm": 35.7,
+    "interval_mm": 14.2,
+    "diameter_mm": 4268.0,
+    "camera_dist_mm": 5007.0,
+    "water_detected": true,
+    "water_coverage": 0.414,
+    "method1_astm_d6433": {
+      "severity": "Deep",
+      "depth_band": "Moderate",
+      "diameter_band": "Large",
+      "depth_mm": 35.7,
+      "diameter_mm": 4268.0,
+      "cell_coords": [
+        1,
+        2
+      ],
+      "rationale": "Promoted to Deep: Moderate depth (35.7 mm) combined with large diameter (4268 mm) poses high suspension risk."
+    },
+    "method2_two_tier": {
+      "tier1_physical_class": "Deep",
+      "tier2_priority": "Priority 1 (Emergency)",
+      "dispatch_window": "Within 24 - 48 Hours",
+      "badge_color": "#ef4444",
+      "priority_reasons": [
+        "Structural defect categorized as Deep under ASTM D6433",
+        "Submerged water trap (41.4% coverage) accelerating sub-base degradation"
+      ]
+    },
+    "method3_road_hazard_score": {
+      "rhs_score": 61.2,
+      "risk_level": "Moderate Risk",
+      "risk_color": "#f59e0b",
+      "effective_depth_mm": 43.2,
+      "breakdown": {
+        "geometry_pts": 43.8,
+        "water_uncertainty_pts": 10.3,
+        "progression_pts": 7.0,
+        "illusion_penalty_pts": 0.0
+      }
+    }
+  }
+]

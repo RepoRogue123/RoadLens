@@ -1,0 +1,44 @@
+[
+  {
+    "pothole_id": 1,
+    "depth_mm": 3.3,
+    "interval_mm": 14.2,
+    "diameter_mm": 1619.0,
+    "camera_dist_mm": 2274.0,
+    "water_detected": true,
+    "water_coverage": 0.9173,
+    "method1_astm_d6433": {
+      "severity": "Moderate",
+      "depth_band": "Shallow",
+      "diameter_band": "Large",
+      "depth_mm": 3.3,
+      "diameter_mm": 1619.0,
+      "cell_coords": [
+        0,
+        2
+      ],
+      "rationale": "Promoted to Moderate: Shallow depth (3.3 mm) spans a wide 1619 mm impact zone."
+    },
+    "method2_two_tier": {
+      "tier1_physical_class": "Moderate",
+      "tier2_priority": "Priority 1 (Emergency)",
+      "dispatch_window": "Within 24 - 48 Hours",
+      "badge_color": "#ef4444",
+      "priority_reasons": [
+        "Moderate defect submerged in water: concealed depth hazard & hydraulic pumping risk"
+      ]
+    },
+    "method3_road_hazard_score": {
+      "rhs_score": 52.0,
+      "risk_level": "Moderate Risk",
+      "risk_color": "#f59e0b",
+      "effective_depth_mm": 19.8,
+      "breakdown": {
+        "geometry_pts": 22.2,
+        "water_uncertainty_pts": 22.9,
+        "progression_pts": 6.8,
+        "illusion_penalty_pts": 0.0
+      }
+    }
+  }
+]
