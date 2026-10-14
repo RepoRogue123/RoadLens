@@ -1,0 +1,32 @@
+{
+  "best_v2.pt@0.35": {
+    "box_recall": 0.12617030762371823,
+    "n_boxes": 2243,
+    "stray_per_img": 0.5453237410071943,
+    "neg_frames_hit": 0.4066666666666667,
+    "neg_masks_per_img": 0.5366666666666666,
+    "neg_masks_top_third": 81,
+    "neg_masks": 322,
+    "n_neg_frames": 600
+  },
+  "best_v3.pt@0.35": {
+    "box_recall": 0.22157824342398574,
+    "n_boxes": 2243,
+    "stray_per_img": 0.11079136690647481,
+    "neg_frames_hit": 0.07333333333333333,
+    "neg_masks_per_img": 0.08166666666666667,
+    "neg_masks_top_third": 3,
+    "neg_masks": 49,
+    "n_neg_frames": 600
+  },
+  "best_v3.pt@0.25": {
+    "box_recall": 0.26660722246990637,
+    "n_boxes": 2243,
+    "stray_per_img": 0.1841726618705036,
+    "neg_frames_hit": 0.10166666666666667,
+    "neg_masks_per_img": 0.11833333333333333,
+    "neg_masks_top_third": 6,
+    "neg_masks": 71,
+    "n_neg_frames": 600
+  }
+}

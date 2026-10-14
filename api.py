@@ -1063,7 +1063,8 @@ def _current_model_insights() -> Dict[str, object]:
         sources.append({"dataset": "Fan stereo sets", "sensor": "stereo camera, never trained on",
                         "value": _r(fan["mae"], 1), "unit": "mm",
                         "metric": f"mean error, {fan['n']} potholes; reads deep holes too shallow"})
-    p600 = ((_read_json(ML_RESULTS_DIR / "pothole600" / "relief_shape_eval_served.json") or {})
+    # The v8+v3 run scores the networks that are served now; "_served" predates their install.
+    p600 = ((_read_json(ML_RESULTS_DIR / "pothole600" / "relief_shape_eval_v8v3.json") or {})
             .get("splits", {}).get("testing", {}))
     if p600.get("relief"):
         sources.append({"dataset": "Pothole-600", "sensor": "stereo-derived depth picture, no scale",

@@ -1,0 +1,160 @@
+{
+  "spearman_vs_measured": {
+    "Depth-Anything-V2 (old depth model)": 0.12096957495859988,
+    "Shape-from-shading": -0.13409450054659003,
+    "Boundary curvature": -0.10667570434349666,
+    "Pothole area alone": 0.2822258120379691,
+    "MoGe-3, raw": 0.5206013031572339,
+    "MoGe-3 features + regressor": 0.6261811215378121,
+    "Depth network (current)": 0.7337091816302453
+  },
+  "mae_mm": {
+    "Guess the median every time": 13.630913043478262,
+    "MoGe-3, raw": 39.865235014492754,
+    "MoGe-3 features + regressor": 10.593195721532393,
+    "Depth network (current)": 8.083065459416435
+  },
+  "old_verdict_vs_measured": {
+    "Shallow": {
+      "Shallow": 40,
+      "Moderate": 51,
+      "Deep": 177
+    },
+    "Moderate": {
+      "Shallow": 51,
+      "Moderate": 69,
+      "Deep": 240
+    },
+    "Deep": {
+      "Shallow": 29,
+      "Moderate": 5,
+      "Deep": 80
+    }
+  },
+  "stats": {
+    "n_test": 207,
+    "n_legacy": 742,
+    "old_said_deep": 497,
+    "measured_deep": 114,
+    "old_deep_on_shallow": 177,
+    "measured_shallow": 268,
+    "downgraded_measured_deep": 25,
+    "downgraded_total": 77,
+    "sfs_negative_share": 0.5314009661835749,
+    "sfs_rho_median": -0.010019151608201802,
+    "moge_raw_over_share": 0.7922705314009661,
+    "moge_raw_mean_bias": 34.54005623188406
+  },
+  "cases": {
+    "old_too_high": {
+      "key": "20250305_093851",
+      "pothole": 1,
+      "legacy_vote": "Deep",
+      "legacy_served": "Deep",
+      "semantic_verdict": "heterogeneous_interior_confirms",
+      "rule": "Deep",
+      "dinov2_ratio": 1.358654,
+      "dinov2_patches": 210,
+      "gt_mm": 7.274,
+      "measured": "Shallow",
+      "relief": 15.23016269983714
+    },
+    "dinov2_downgrade": {
+      "key": "20250305_103950",
+      "pothole": 1,
+      "legacy_vote": "Deep",
+      "legacy_served": "Shallow",
+      "semantic_verdict": "downgraded_texture_illusion",
+      "rule": "Moderate",
+      "dinov2_ratio": 0.768791,
+      "dinov2_patches": 86,
+      "gt_mm": 82.707,
+      "measured": "Deep",
+      "relief": 25.10878282742919
+    },
+    "da_pair": [
+      {
+        "key": "20250227_171856",
+        "pothole": 1,
+        "gt_mm": 72.881,
+        "relief": 13.89696918764014,
+        "regressor": 39.11680529546727,
+        "mf_p90_mm": 74.752452,
+        "cv_mean_curvature": 0.016862,
+        "sh_log_area_px": 10.591547,
+        "da_bowl": 0.03223099790927897,
+        "sfs_bowl": 0.814176399580666,
+        "sfs_rho": -0.08518242139002462
+      },
+      {
+        "key": "20250305_093835",
+        "pothole": 1,
+        "gt_mm": 11.086,
+        "relief": 14.251068370686363,
+        "regressor": 25.212515943563652,
+        "mf_p90_mm": 75.015281,
+        "cv_mean_curvature": 0.013991,
+        "sh_log_area_px": 10.88725,
+        "da_bowl": 1.208297023065981,
+        "sfs_bowl": 0.7544943405042371,
+        "sfs_rho": -0.14096146007460408
+      }
+    ],
+    "curv_pair": [
+      {
+        "key": "20250305_135009",
+        "pothole": 2,
+        "gt_mm": 6.347,
+        "relief": 10.84599686993092,
+        "regressor": 16.87431355795934,
+        "mf_p90_mm": 3.896087,
+        "cv_mean_curvature": 0.027537,
+        "sh_log_area_px": 8.971575,
+        "da_bowl": 0.00804560031812751,
+        "sfs_bowl": 0.8600931425222702,
+        "sfs_rho": 0.1315444658548499
+      },
+      {
+        "key": "20250305_081309",
+        "pothole": 1,
+        "gt_mm": 93.3,
+        "relief": 65.1270014409801,
+        "regressor": 53.97215202046001,
+        "mf_p90_mm": 229.102545,
+        "cv_mean_curvature": 0.009081,
+        "sh_log_area_px": 11.801257,
+        "da_bowl": 1.026828901552585,
+        "sfs_bowl": 0.6533545051124964,
+        "sfs_rho": 0.17152403207547187
+      }
+    ],
+    "moge_raw": {
+      "key": "20250227_183313",
+      "pothole": 1,
+      "gt_mm": 68.541,
+      "relief": 60.62656593918336,
+      "regressor": 52.75844463734792,
+      "mf_p90_mm": 349.594828,
+      "cv_mean_curvature": 0.01126,
+      "sh_log_area_px": 11.347402,
+      "da_bowl": 0.43565465440316237,
+      "sfs_bowl": 0.8017799919588143,
+      "sfs_rho": -0.09344014243362753,
+      "over": 281.053828
+    },
+    "sfs": {
+      "key": "20250305_103915",
+      "pothole": 1,
+      "gt_mm": 73.175,
+      "relief": 52.406025002658616,
+      "regressor": 49.67780193449116,
+      "mf_p90_mm": 142.298937,
+      "cv_mean_curvature": 0.011145,
+      "sh_log_area_px": 12.278942,
+      "da_bowl": 0.38965900524511865,
+      "sfs_bowl": 0.7760438223797662,
+      "sfs_rho": -0.5844208646088874
+    }
+  },
+  "median_guess_mm": 27.982
+}

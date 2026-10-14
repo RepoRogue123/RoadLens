@@ -1,0 +1,122 @@
+{
+  "n": 142,
+  "n_water": 53,
+  "ensemble": {
+    "missed_water": 22,
+    "false_alarms": 11,
+    "precision": 0.7380952380952381,
+    "recall": 0.5849056603773585
+  },
+  "clipseg": {
+    "missed_water": 17,
+    "false_alarms": 33,
+    "precision": 0.5217391304347826,
+    "recall": 0.6792452830188679
+  },
+  "segmenter_by_threshold": {
+    "0.05": {
+      "missed_water": 11,
+      "false_alarms": 18,
+      "precision": 0.7,
+      "recall": 0.7924528301886793
+    },
+    "0.1": {
+      "missed_water": 11,
+      "false_alarms": 15,
+      "precision": 0.7368421052631579,
+      "recall": 0.7924528301886793
+    },
+    "0.15": {
+      "missed_water": 13,
+      "false_alarms": 14,
+      "precision": 0.7407407407407407,
+      "recall": 0.7547169811320755
+    },
+    "0.2": {
+      "missed_water": 15,
+      "false_alarms": 13,
+      "precision": 0.7450980392156863,
+      "recall": 0.7169811320754716
+    },
+    "0.3": {
+      "missed_water": 18,
+      "false_alarms": 12,
+      "precision": 0.7446808510638298,
+      "recall": 0.660377358490566
+    },
+    "0.4": {
+      "missed_water": 21,
+      "false_alarms": 11,
+      "precision": 0.7441860465116279,
+      "recall": 0.6037735849056604
+    },
+    "0.5": {
+      "missed_water": 24,
+      "false_alarms": 11,
+      "precision": 0.725,
+      "recall": 0.5471698113207547
+    }
+  },
+  "segmenter_crossfit": {
+    "missed_water": 13,
+    "false_alarms": 15,
+    "precision": 0.7272727272727273,
+    "recall": 0.7547169811320755,
+    "thresholds_chosen": [
+      0.1,
+      0.15
+    ]
+  },
+  "decision": "segmenter decides",
+  "served_threshold": 0.1,
+  "by_source": {
+    "kaggle": {
+      "n": 42,
+      "n_water": 25,
+      "ensemble": {
+        "missed_water": 10,
+        "false_alarms": 2,
+        "precision": 0.8823529411764706,
+        "recall": 0.6
+      },
+      "segmenter": {
+        "missed_water": 6,
+        "false_alarms": 2,
+        "precision": 0.9047619047619048,
+        "recall": 0.76
+      }
+    },
+    "mendeley": {
+      "n": 55,
+      "n_water": 24,
+      "ensemble": {
+        "missed_water": 8,
+        "false_alarms": 4,
+        "precision": 0.8,
+        "recall": 0.6666666666666666
+      },
+      "segmenter": {
+        "missed_water": 3,
+        "false_alarms": 4,
+        "precision": 0.84,
+        "recall": 0.875
+      }
+    },
+    "pothrgbd": {
+      "n": 45,
+      "n_water": 4,
+      "ensemble": {
+        "missed_water": 4,
+        "false_alarms": 5,
+        "precision": 0.0,
+        "recall": 0.0
+      },
+      "segmenter": {
+        "missed_water": 2,
+        "false_alarms": 9,
+        "precision": 0.18181818181818182,
+        "recall": 0.5
+      }
+    }
+  }
+}

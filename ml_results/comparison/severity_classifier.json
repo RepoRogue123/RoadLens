@@ -1,0 +1,19 @@
+{
+  "val": {
+    "n": 97,
+    "correct": 0.6391752577319587,
+    "cost": 0.6597938144329897,
+    "under_reported": 11,
+    "deep_found": 9,
+    "n_deep": 16,
+    "epoch": 15
+  },
+  "test": {
+    "n": 207,
+    "correct": 0.6280193236714976,
+    "cost": 0.7439613526570048,
+    "under_reported": 32,
+    "deep_found": 12,
+    "n_deep": 29
+  }
+}

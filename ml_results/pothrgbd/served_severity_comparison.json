@@ -1,0 +1,160 @@
+{
+  "legacy_vote": {
+    "accuracy": 0.26819407008086255,
+    "macro_f1": 0.2469476991633565,
+    "under_reported": 29,
+    "policy_cost": 1.0849056603773586,
+    "n": 742,
+    "confusion": [
+      [
+        21,
+        55,
+        192
+      ],
+      [
+        19,
+        74,
+        267
+      ],
+      [
+        4,
+        6,
+        104
+      ]
+    ],
+    "deep_recall": 0.9122807017543859
+  },
+  "legacy_served": {
+    "accuracy": 0.25471698113207547,
+    "macro_f1": 0.25086248108840786,
+    "under_reported": 85,
+    "policy_cost": 1.330188679245283,
+    "n": 742,
+    "confusion": [
+      [
+        40,
+        51,
+        177
+      ],
+      [
+        51,
+        69,
+        240
+      ],
+      [
+        29,
+        5,
+        80
+      ]
+    ],
+    "deep_recall": 0.7017543859649122
+  },
+  "metric_point": {
+    "accuracy": 0.5970350404312669,
+    "macro_f1": 0.5171244419429083,
+    "under_reported": 150,
+    "policy_cost": 0.8328840970350404,
+    "n": 742,
+    "confusion": [
+      [
+        135,
+        129,
+        4
+      ],
+      [
+        61,
+        283,
+        16
+      ],
+      [
+        5,
+        84,
+        25
+      ]
+    ],
+    "deep_recall": 0.21929824561403508
+  },
+  "metric_policy": {
+    "accuracy": 0.45956873315363883,
+    "macro_f1": 0.40318500261135465,
+    "under_reported": 66,
+    "policy_cost": 0.7452830188679245,
+    "n": 742,
+    "confusion": [
+      [
+        34,
+        214,
+        20
+      ],
+      [
+        18,
+        241,
+        101
+      ],
+      [
+        0,
+        48,
+        66
+      ]
+    ],
+    "deep_recall": 0.5789473684210527
+  },
+  "metric_policy_plus_override": {
+    "accuracy": 0.4380053908355795,
+    "macro_f1": 0.3727734535857261,
+    "under_reported": 88,
+    "policy_cost": 0.8733153638814016,
+    "n": 742,
+    "confusion": [
+      [
+        29,
+        220,
+        19
+      ],
+      [
+        28,
+        242,
+        90
+      ],
+      [
+        12,
+        48,
+        54
+      ]
+    ],
+    "deep_recall": 0.47368421052631576
+  },
+  "majority_class": {
+    "accuracy": 0.48517520215633425,
+    "macro_f1": 0.2177858439201452,
+    "under_reported": 114,
+    "policy_cost": 0.8221024258760108,
+    "n": 742,
+    "confusion": [
+      [
+        0,
+        268,
+        0
+      ],
+      [
+        0,
+        360,
+        0
+      ],
+      [
+        0,
+        114,
+        0
+      ]
+    ],
+    "deep_recall": 0.0
+  },
+  "semantic_verdicts": {
+    "inconclusive": 496,
+    "smooth_interior_no_action": 86,
+    "downgraded_texture_illusion": 77,
+    "heterogeneous_interior_confirms": 65,
+    "unavailable": 11,
+    "abstained_sparse_patches": 7
+  }
+}
