@@ -13,6 +13,8 @@ import DepthProfileChart from './DepthProfileChart';
 import TemporalPrognosis from './TemporalPrognosis';
 import SemanticIntelligence from './SemanticIntelligence';
 import WaterHazardAlert from './WaterHazardAlert';
+import WheelDropPanel from './WheelDropPanel';
+import RiskMatrixPanel from './RiskMatrixPanel';
 import { panelCascade, panelEnter } from '../../theme/motion';
 
 /** Mono section rail: ── LABEL ────── */
@@ -171,6 +173,17 @@ export default function BentoDashboard({ results }) {
       <Motion.div variants={panelEnter}>
         <DepthProfileChart potholes={results.potholes} />
       </Motion.div>
+
+      {/* 3b. What the pothole does to a vehicle, and how soon to repair it */}
+      {primaryPothole.hazard && (
+        <Motion.div variants={panelEnter}>
+          <SectionRail label="Hazard to vehicles" />
+          <div className="mt-3 space-y-6">
+            <WheelDropPanel key={`wheel-${primaryPothole.id}`} hazard={primaryPothole.hazard} />
+            <RiskMatrixPanel key={`risk-${primaryPothole.id}`} risk={primaryPothole.hazard.risk} />
+          </div>
+        </Motion.div>
+      )}
 
       {/* 4. Core telemetry */}
       <Motion.div variants={panelEnter}>

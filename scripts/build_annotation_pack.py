@@ -17,9 +17,19 @@ shuffled within each source/stratum and dealt to annotator pairs in rotation, so
 person gets the same share of every source and every pair overlaps on the same amount —
 the overlap is what lets scripts/merge_annotations.py measure agreement.
 
+Two tasks rate HAZARD (Methods 2B and 3B of scripts/cvpr_severity_framework.py). Their
+potholes come from data/hazard_pool.csv (scripts/build_hazard_pool.py: every dataset with
+photos, outlines and measurements already frozen), so no segmenter runs here:
+    consequence    one pothole: how bad would hitting it be, 1-5 (the risk matrix's scale)
+    hazard_pairs   two potholes side by side: which is more dangerous to drive into?
+                   Pairs are drawn at random from the pool, each pothole in about
+                   --pair-factor pairs, never two from the same photo.
+
 Usage:
     python scripts/build_annotation_pack.py --task water --annotators atharva,vyankatesh,shashank
     python scripts/build_annotation_pack.py --task illusion --annotators atharva,vyankatesh,shashank
+    python scripts/build_annotation_pack.py --task consequence --annotators atharva,vyankatesh,shashank
+    python scripts/build_annotation_pack.py --task hazard_pairs --annotators atharva,vyankatesh,shashank
 
 Output: packs/<task>_v<N>/ and packs/RoadLens_<task>_pack_v<N>.zip (packs/ is gitignored).
 """
@@ -66,7 +76,34 @@ TASKS = {
             "not_a_pothole": "The yellow outline is not around a pothole (sky, trees, a car, a logo, a thin edge sliver) or misses the pothole. Excluded from evaluation; it tells us how often the segmenter is wrong.",
         },
     },
+    "consequence": {
+        "title": "RoadLens - how bad would it be to hit this pothole?",
+        "question": "If a car, motorbike or bicycle hit this at normal speed: 1 insignificant ... 5 major",
+        "keys": {"1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "0": "unclear", "x": "not_a_pothole"},
+        "definitions": {
+            "1": "Insignificant: a bump nobody would notice.",
+            "2": "Minor: uncomfortable jolt; no damage expected.",
+            "3": "Moderate: could damage a tyre or rim, or unsettle a two-wheeler.",
+            "4": "Significant: likely tyre/wheel damage; a two-wheeler could lose control.",
+            "5": "Major: could cause a crash or serious vehicle damage.",
+            "unclear": "You cannot judge it from the photo (blurred, too far, hidden). Never guess.",
+            "not_a_pothole": "The yellow outline is not around a pothole. Excluded.",
+        },
+    },
+    "hazard_pairs": {
+        "title": "RoadLens - which pothole is more dangerous?",
+        "question": "Which pothole is more dangerous to drive into: A (left) or B (right)?",
+        "keys": {"a": "a", "b": "b", "e": "equal", "0": "unclear", "x": "not_a_pothole"},
+        "definitions": {
+            "a": "A (left) is more dangerous to drive into.",
+            "b": "B (right) is more dangerous to drive into.",
+            "equal": "About equally dangerous.",
+            "unclear": "You cannot judge one of them from the photo. Never guess.",
+            "not_a_pothole": "At least one yellow outline is not around a pothole. Excluded.",
+        },
+    },
 }
+POOL_TASKS = ("consequence", "hazard_pairs")
 
 
 def candidates(task):
@@ -81,6 +118,53 @@ def candidates(task):
         top = os.path.relpath(path, PROJECT_DIR).replace("\\", "/").split("/")[0]   # data1 / merged_dataset
         out.append((path, 0, "kaggle" if top == "data1" else top, stratum, {}))
     return out
+
+
+def pool_items(task, pair_factor):
+    """Items for the hazard tasks, from data/hazard_pool.csv (outlines already frozen)."""
+    import pandas as pd
+    from scripts.build_hazard_pool import POOL_CSV
+    if not os.path.isfile(POOL_CSV):
+        sys.exit("data/hazard_pool.csv missing - run scripts/build_hazard_pool.py first")
+    pool = pd.read_csv(POOL_CSV).to_dict("records")
+    if task == "consequence":
+        return [{"pool_ids": [r["pool_id"]], "source": r["source"], "stratum": r["source"]} for r in pool]
+    rng = np.random.default_rng(SEED)
+    n_pairs = int(round(len(pool) * pair_factor / 2))
+    seen, out = set(), []
+    while len(out) < n_pairs:
+        i, j = rng.choice(len(pool), 2, replace=False)
+        a, b = pool[i], pool[j]
+        key = tuple(sorted((a["pool_id"], b["pool_id"])))
+        if a["image"] == b["image"] or key in seen:
+            continue
+        seen.add(key)
+        out.append({"pool_ids": [a["pool_id"], b["pool_id"]], "source": f"{a['source']}|{b['source']}",
+                    "stratum": "pairs"})
+    return out
+
+
+def pool_view(rows, caption):
+    """One pothole (photo + zoomed crop), or two side by side labelled A and B."""
+    import scripts.label_pothole_water as L
+    panels = []
+    for k, r in enumerate(rows):
+        img = cv2.imread(os.path.join(PROJECT_DIR, r["image"]))
+        mask = mask_from_polygon(r["polygon"], *img.shape[:2])
+        v = L.build_view(img, mask, "")[:-60]
+        if len(rows) == 2:
+            v = cv2.resize(v, (int(v.shape[1] * 360 / v.shape[0]), 360))
+            cv2.putText(v, "AB"[k], (12, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0, 255, 255), 3)
+        panels.append(v)
+    if len(panels) == 2:
+        h = max(p.shape[0] for p in panels)
+        gap = np.full((h, 16, 3), 255, np.uint8)
+        view = np.hstack([panels[0], gap, panels[1]])
+    else:
+        view = panels[0]
+    bar = np.zeros((40, view.shape[1], 3), np.uint8)
+    cv2.putText(bar, caption, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+    return np.vstack([view, bar])
 
 
 def view_for(task, img, mask, caption):
@@ -115,6 +199,7 @@ def main():
     ap.add_argument("--annotators", required=True, help="comma-separated first names")
     ap.add_argument("--overlap", type=int, default=2)
     ap.add_argument("--version", type=int, default=1)
+    ap.add_argument("--pair-factor", type=float, default=3.0, help="hazard_pairs: pairs each pothole appears in")
     args = ap.parse_args()
     annotators = [a.strip().lower() for a in args.annotators.split(",") if a.strip()]
     if not 1 <= args.overlap <= len(annotators):
@@ -128,7 +213,18 @@ def main():
     os.makedirs(os.path.join(out, "items"))
 
     items = []
-    for n, (path, idx, source, stratum, _extra) in enumerate(candidates(args.task), start=1):
+    if args.task in POOL_TASKS:
+        import pandas as pd
+        from scripts.build_hazard_pool import POOL_CSV
+        pool = {r["pool_id"]: r for r in pd.read_csv(POOL_CSV).to_dict("records")}
+        for n, it in enumerate(pool_items(args.task, args.pair_factor), start=1):
+            item_id = f"{args.task[0]}{n:04d}"
+            cv2.imwrite(os.path.join(out, "items", f"{item_id}.jpg"),
+                        pool_view([pool[i] for i in it["pool_ids"]], item_id), [cv2.IMWRITE_JPEG_QUALITY, 88])
+            items.append({"item_id": item_id, "source": it["source"], "stratum": it["stratum"],
+                          "pool_ids": ";".join(it["pool_ids"])})
+    for n, (path, idx, source, stratum, _extra) in enumerate(
+            [] if args.task in POOL_TASKS else candidates(args.task), start=1):
         img = cv2.imread(path)
         masks = segmentation.get_all_masks(path)
         if img is None or idx >= len(masks):
@@ -154,7 +250,7 @@ def main():
     write_csv(os.path.join(out, "manifest.csv"), items, fields)
     task_json = {"task": args.task, "version": args.version, "created": str(date.today()),
                  "annotators": annotators, "overlap": args.overlap,
-                 "segmenter": os.path.basename(segmentation.MODEL_PATH),
+                 "segmenter": "data/hazard_pool.csv" if args.task in POOL_TASKS else os.path.basename(segmentation.MODEL_PATH),
                  "segmenter_conf": segmentation.CONF_THRESHOLD, **spec}
     with open(os.path.join(out, "task.json"), "w", encoding="utf-8") as f:
         json.dump(task_json, f, indent=2)
@@ -170,7 +266,9 @@ def main():
     zip_path = shutil.make_archive(os.path.join(PACKS, f"RoadLens_{args.task}_pack_v{args.version}"),
                                    "zip", root_dir=PACKS, base_dir=os.path.basename(out))
     per = {a: sum(a in r["assigned_to"].split(";") for r in items) for a in annotators}
-    print(f"{len(items)} potholes frozen with {task_json['segmenter']} @ {task_json['segmenter_conf']}")
+    what = "pairs" if args.task == "hazard_pairs" else "potholes"
+    print(f"{len(items)} {what} frozen" + (" from data/hazard_pool.csv" if args.task in POOL_TASKS else
+                                          f" with {task_json['segmenter']} @ {task_json['segmenter_conf']}"))
     print(f"  each labelled by {args.overlap}; per person: {per}")
     print(f"  wrote {os.path.relpath(out, PROJECT_DIR)}/ and {os.path.relpath(zip_path, PROJECT_DIR)} "
           f"({os.path.getsize(zip_path) / 1e6:.1f} MB)")

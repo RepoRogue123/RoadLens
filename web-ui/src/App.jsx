@@ -173,7 +173,7 @@ export default function App() {
                       <RotateCcw className="w-3 h-3" /> New scan
                     </button>
                   </div>
-                  <BentoDashboard results={apiResults} />
+                  <BentoDashboard key={scanId} results={apiResults} />
                 </>
               )}
             </Motion.div>
@@ -197,8 +197,8 @@ export default function App() {
                 bodyClassName="px-4 py-3"
               >
                 <p className="text-sm text-slate-400">
-                  Benchmark metrics, ablation studies and the full validation graph gallery —
-                  streamed from the training run in <span className="font-mono text-slate-300">ml_results/</span>.
+                  How well the system works, measured on potholes it never trained on. The current depth network
+                  and the retired classifier vote are shown separately, because they were scored in different ways.
                 </p>
               </InstrumentPanel>
 

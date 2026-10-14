@@ -14,13 +14,19 @@ Reads the returned labels_<task>_v<N>_<name>.csv files (from any folder) and:
      --annotator consensus). A consensus file, when given, settles disputes;
   4. writes the label file the evaluation script already reads, with the frozen
      outline attached so evaluation scores exactly the pothole people saw:
-        water     -> data/pothole_water_labels.csv   (scripts/eval_pothole_water.py)
-        illusion  -> data/illusion_labels.csv        (scripts/calibrate_semantic.py)
+        water         -> data/pothole_water_labels.csv   (scripts/eval_pothole_water.py)
+        illusion      -> data/illusion_labels.csv        (scripts/calibrate_semantic.py)
+        consequence   -> data/consequence_labels.csv     (scripts/fit_priority_model.py)
+        hazard_pairs  -> data/hazard_pair_labels.csv     (scripts/fit_hazard_pairs.py)
   5. saves agreement_report.txt in the pack folder.
 
 "unclear" and "not_a_pothole" are kept as answers: when both labellers give one, the item
 is final but left out of evaluation; one of them against a real label is a dispute. The
 not_a_pothole share is reported: it is the segmenter's false-detection rate on this sample.
+
+consequence is a 1-5 scale, so exact agreement is too strict: two ratings at most one
+apart are final with their mean (e.g. 3 and 4 -> 3.5), two or more apart are disputed.
+Its agreement is also given as quadratically weighted kappa (near misses count partly).
 """
 import argparse
 import csv
@@ -40,6 +46,10 @@ OUTPUTS = {
               ["image", "pothole_idx", "source", "label", "polygon"]),
     "illusion": (os.path.join(PROJECT_DIR, "data", "illusion_labels.csv"),
                  ["image", "pothole_idx", "label", "stratum", "interior_lapvar", "interior_mean", "polygon"]),
+    "consequence": (os.path.join(PROJECT_DIR, "data", "consequence_labels.csv"),
+                    ["item_id", "pool_id", "source", "label"]),
+    "hazard_pairs": (os.path.join(PROJECT_DIR, "data", "hazard_pair_labels.csv"),
+                     ["item_id", "pool_a", "pool_b", "source", "label"]),
 }
 
 
@@ -55,6 +65,30 @@ def cohen_kappa(a, b):
     ca, cb = Counter(a), Counter(b)
     pe = sum(ca[c] * cb[c] for c in set(a) | set(b)) / (n * n)
     return (po - pe) / (1 - pe) if pe < 1 else 1.0
+
+
+def weighted_kappa(a, b, k=5):
+    """Quadratically weighted kappa for two raters on a 1..k scale."""
+    a, b = [int(x) - 1 for x in a], [int(x) - 1 for x in b]
+    n = len(a)
+    if n == 0:
+        return float("nan")
+    obs = [[0.0] * k for _ in range(k)]
+    for x, y in zip(a, b):
+        obs[x][y] += 1
+    ra, rb = Counter(a), Counter(b)
+    num = sum((i - j) ** 2 * obs[i][j] for i in range(k) for j in range(k))
+    den = sum((i - j) ** 2 * ra[i] * rb[j] / n for i in range(k) for j in range(k))
+    return 1 - num / den if den else 1.0
+
+
+def settle(task, values):
+    """Final label from the assigned labellers' answers, or None when they disagree."""
+    if len(set(values)) == 1:
+        return values[0]
+    if task == "consequence" and all(v.isdigit() for v in values) and max(map(int, values)) - min(map(int, values)) <= 1:
+        return f"{sum(map(int, values)) / len(values):g}"
+    return None
 
 
 def main():
@@ -107,6 +141,12 @@ def main():
     if all_a:
         lines.append(f"{'all pairs':28s} {len(all_a):5d} "
                      f"{sum(x == y for x, y in zip(all_a, all_b)) / len(all_a):6.1%} {cohen_kappa(all_a, all_b):6.2f}")
+    if task["task"] == "consequence":
+        num = [(x, y) for x, y in zip(all_a, all_b) if x.isdigit() and y.isdigit()]
+        if num:
+            within = sum(abs(int(x) - int(y)) <= 1 for x, y in num) / len(num)
+            lines.append(f"{'rated by both':28s} {len(num):5d}  within one point {within:.1%}, "
+                         f"weighted kappa {weighted_kappa(*zip(*num)):.2f}")
 
     final, disputed, pending = {}, [], []
     for iid, r in items.items():
@@ -116,8 +156,8 @@ def main():
             final[iid] = consensus[iid]
         elif len([a for a in need if a in got]) < len(need):
             pending.append(iid)
-        elif len(set(got[a] for a in need)) == 1:
-            final[iid] = got[need[0]]
+        elif settle(task["task"], [got[a] for a in need]) is not None:
+            final[iid] = settle(task["task"], [got[a] for a in need])
         else:
             row = {"item_id": iid, "source": r["source"]}
             for n, a in enumerate(need, start=1):
@@ -153,9 +193,11 @@ def main():
         rows = []
         for iid in usable:
             r = items[iid]
-            row = {"image": r["image"], "pothole_idx": r["pothole_idx"], "source": r["source"],
-                   "label": final[iid], "polygon": r["polygon"], "stratum": r.get("stratum", ""),
-                   "interior_lapvar": r.get("interior_lapvar", ""), "interior_mean": r.get("interior_mean", "")}
+            pool = (r.get("pool_ids") or "").split(";")
+            row = {"image": r.get("image", ""), "pothole_idx": r.get("pothole_idx", ""), "source": r["source"],
+                   "label": final[iid], "polygon": r.get("polygon", ""), "stratum": r.get("stratum", ""),
+                   "interior_lapvar": r.get("interior_lapvar", ""), "interior_mean": r.get("interior_mean", ""),
+                   "item_id": iid, "pool_id": pool[0], "pool_a": pool[0], "pool_b": pool[-1]}
             if task["task"] == "illusion":
                 row["image"] = os.path.basename(r["image"])     # calibrate_semantic finds images by name
             rows.append({k: row[k] for k in fields})

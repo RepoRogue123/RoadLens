@@ -1,5 +1,6 @@
 import base64
 import csv
+import json
 import os
 import re
 import tempfile
@@ -8,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -73,6 +74,16 @@ try:
     _HAS_METRIC = metric_severity.HAS_METRIC
 except Exception:
     _HAS_METRIC = False
+
+# Wheel drop by tyre and the UK risk matrix (hazard.py; Methods 2 and 3 of
+# scripts/cvpr_severity_framework.py). Needs the relief network's map.
+try:
+    import hazard
+    from scripts.cvpr_severity_framework import DEFAULT_LIKELIHOOD, GRADING_SEED, compute_risk_matrix, error_model
+    _HAS_HAZARD = True
+except Exception:
+    _HAS_HAZARD = False
+    DEFAULT_LIKELIHOOD = 3
 
 app = FastAPI(title="Pothole Detection API")
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -846,8 +857,235 @@ def _build_graph_manifest() -> List[Dict[str, str]]:
     return graphs
 
 
+# --- Insights for the current depth model ---------------------------------------
+# Everything here is scored against measured depth on held-out data (PothRGBD capture
+# sessions never seen in training, RSRD drives, Fan, Pothole-600), unlike the legacy
+# classifier reports above, which were scored against labels the pipeline made itself.
+# Each block is optional: a missing file drops that block, not the page. relief_meta.json
+# ships with the repository, so the headline numbers survive a fresh clone.
+RELIEF_META_PATH = PROJECT_ROOT / "ml_models" / "metric" / "relief_meta.json"
+COUNTEREXAMPLE_DIR = ML_RESULTS_DIR / "figures" / "counterexamples"
+BANDS = ["Shallow", "Moderate", "Deep"]
+
+# Depth-network versions, oldest first; descriptions follow the MASTER_DOC run tables.
+RELIEF_VERSIONS = [
+    ("v1", "v1", "first recipe: colour jitter and flips"),
+    ("ens23", "v2+v3", "stronger augmentation, weight averaging, plane-invariant loss"),
+    ("v4", "v4", "road plane fitted exactly, in inverse depth"),
+    ("v4v3", "v4+v3", "v4 averaged with v3"),
+    ("v8v3", "v8+v3", "v4 recipe plus RSRD driving data, averaged with v3 (served)"),
+]
+
+
+def _read_json(path: Path) -> Optional[dict]:
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _r(x, nd=2):
+    """Round for JSON; NaN and missing become None."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return None
+    return None if x != x else round(x, nd)
+
+
+def _band_of(mm: float, moderate_from: float, deep_from: float) -> int:
+    return 0 if mm < moderate_from else 1 if mm < deep_from else 2
+
+
+def _counterexample_captions(summary: dict) -> List[Dict[str, object]]:
+    """One card per old approach: what it said, what was measured, what reads it now."""
+    s, cases, rho = summary.get("stats", {}), summary.get("cases", {}), summary.get("spearman_vs_measured", {})
+    old, dino = cases.get("old_too_high") or {}, cases.get("dinov2_downgrade") or {}
+    cards = [
+        ("01_old_verdict_too_high.png", "Old served verdict",
+         f"Called Deep; measured {old.get('gt_mm', 0):.0f} mm (Shallow). Across {s.get('n_legacy')} measured "
+         f"potholes it called {s.get('old_deep_on_shallow')} of {s.get('measured_shallow')} Shallow ones Deep.",
+         old.get("relief"), old.get("gt_mm")),
+        ("02_dinov2_downgrade.png", "DINOv2 texture check",
+         f"Downgraded a {dino.get('gt_mm', 0):.0f} mm hole to Shallow as a 'texture illusion'. "
+         f"{s.get('downgraded_measured_deep')} of its {s.get('downgraded_total')} downgrades were measured Deep.",
+         dino.get("relief"), dino.get("gt_mm")),
+        ("03_depth_anything_pair.png", "Depth-Anything-V2 (relative depth)",
+         f"Rank correlation with measured depth: {rho.get('Depth-Anything-V2 (old depth model)', 0):.2f}. "
+         "Two potholes of very different measured depth read alike.", None, None),
+        ("04_curvature_pair.png", "Boundary curvature",
+         f"Rank correlation with measured depth: {rho.get('Boundary curvature', 0):.2f}. "
+         "A sharp rim does not mean a deep hole.", None, None),
+        ("05_moge_raw.png", "MoGe-3, raw reading",
+         f"Over-reads {s.get('moge_raw_over_share', 0):.0%} of potholes, by "
+         f"{s.get('moge_raw_mean_bias', 0):.0f} mm on average: road texture reads as depth.", None, None),
+        ("06_shape_from_shading.png", "Shape from shading",
+         f"Its depth ran the wrong way in {s.get('sfs_negative_share', 0):.0%} of potholes "
+         f"(median rank correlation {s.get('sfs_rho_median', 0):.2f}).", None, None),
+    ]
+    return [
+        {"title": title, "caption": caption, "url": f"/insights/figures/{name}",
+         "nowMm": _r(now, 1), "measuredMm": _r(gt, 1)}
+        for name, title, caption, now, gt in cards
+        if (COUNTEREXAMPLE_DIR / name).is_file()
+    ]
+
+
+def _current_model_insights() -> Dict[str, object]:
+    out: Dict[str, object] = {}
+    meta = _read_json(RELIEF_META_PATH)
+    cut = (meta or {}).get("decision_thresholds_mm", {})
+    mod_from, deep_from = cut.get("moderate_from", 22.5), cut.get("deep_from", 48.0)
+
+    if meta:
+        h, y = meta.get("test_human", {}), meta.get("test_yolo", {})
+        out["headline"] = {
+            "fitted": meta.get("fitted"),
+            "nTest": h.get("n"),
+            "maeMm": _r(h.get("mae")), "r": _r(h.get("r"), 3), "within10": _r(h.get("within10"), 3),
+            "maeSegmenterMm": _r(y.get("mae")),
+            "q80Mm": _r(meta.get("abs_error_q80_mm"), 1),
+            "deepFound": y.get("deep_found"), "nDeep": y.get("n_deep"),
+            "correct": _r(y.get("correct"), 3), "cost": _r(y.get("cost"), 3),
+            "moderateFromMm": mod_from, "deepFromMm": deep_from,
+            "weights": [Path(w).parent.name for w in meta.get("weights_from", [])],
+        }
+
+    pothrgbd = ML_RESULTS_DIR / "pothrgbd"
+    evals = {v: _read_json(pothrgbd / f"relief_eval_{v}.json") for v, _, _ in RELIEF_VERSIONS}
+    evals["abs"] = _read_json(pothrgbd / "relief_eval_abs.json")
+    out["progression"] = [
+        {"version": label, "what": what,
+         "maeHuman": _r(evals[v]["human"]["relief"]["mae"]), "maeSegmenter": _r(evals[v]["yolo"]["relief"]["mae"]),
+         "r": _r(evals[v]["yolo"]["relief"]["r"], 3)}
+        for v, label, what in RELIEF_VERSIONS if evals.get(v)
+    ]
+
+    # Same 207-208 held-out potholes, same human outlines, same bowl-depth protocol.
+    summary = _read_json(COUNTEREXAMPLE_DIR / "summary.json") or {}
+    zero_shot = _read_json(ML_RESULTS_DIR / "comparison" / "zero_shot_dav2_metric.json") or {}
+    served = (evals.get("v8v3") or {}).get("human", {})
+    rows = [
+        ("Depth-Anything-V2 metric, zero-shot", "existing", (zero_shot.get("pothrgbd_test") or {}).get("mae"),
+         (zero_shot.get("pothrgbd_test") or {}).get("r")),
+        ("MoGe-3, raw reading", "existing", (summary.get("mae_mm") or {}).get("MoGe-3, raw"), None),
+        ("Absolute-depth network, same backbone", "ablation",
+         ((evals.get("abs") or {}).get("human", {}).get("relief") or {}).get("mae"),
+         ((evals.get("abs") or {}).get("human", {}).get("relief") or {}).get("r")),
+        ("Guess the training median", "floor", (served.get("median") or {}).get("mae"), None),
+        ("MoGe-3 features + regressor", "ours-earlier", (served.get("regressor") or {}).get("mae"),
+         (served.get("regressor") or {}).get("r")),
+        ("Depth network, first recipe (v1)", "ours-earlier",
+         ((evals.get("v1") or {}).get("human", {}).get("relief") or {}).get("mae"),
+         ((evals.get("v1") or {}).get("human", {}).get("relief") or {}).get("r")),
+        ("Depth network, served (v8+v3)", "ours", (served.get("relief") or {}).get("mae"),
+         (served.get("relief") or {}).get("r")),
+    ]
+    out["baselines"] = [{"name": n, "kind": k, "maeMm": _r(m, 1), "r": _r(r, 2)} for n, k, m, r in rows if m is not None]
+
+    if summary.get("spearman_vs_measured"):
+        out["signals"] = [{"name": k, "rho": _r(v, 2)} for k, v in summary["spearman_vs_measured"].items()]
+        out["counterexamples"] = _counterexample_captions(summary)
+
+    # Predicted vs measured, test sessions only; severity matrix on the segmenter's outlines.
+    per_pothole = pothrgbd / "relief_eval_potholes_v8v3.csv"
+    if per_pothole.is_file():
+        points, matrix, missed = [], [[0] * 3 for _ in range(3)], 0
+        with per_pothole.open("r", encoding="utf-8", newline="") as f:
+            for row in csv.DictReader(f):
+                if row.get("split") != "test":
+                    continue
+                mask = "human" if row["mask"] == "human" else "segmenter"
+                if not row.get("relief"):          # the segmenter found no outline for it
+                    missed += mask == "segmenter"
+                    continue
+                gt, pred = float(row["gt_mm"]), float(row["relief"])
+                points.append({"gt": round(gt, 1), "pred": round(pred, 1), "mask": mask, "band": BANDS[int(row["gt_band"])]})
+                if mask == "segmenter":
+                    matrix[int(row["gt_band"])][_band_of(pred, mod_from, deep_from)] += 1
+        out["scatter"] = points
+        out["severityNew"] = {"matrix": matrix, "n": sum(map(sum, matrix)), "missed": missed}
+
+    old = summary.get("old_verdict_vs_measured")
+    if old:
+        out["severityOld"] = {"matrix": [[old[m].get(p, 0) for p in BANDS] for m in BANDS],
+                              "n": sum(sum(v.values()) for v in old.values())}
+
+    legacy = (_read_json(pothrgbd / "served_severity_comparison.json") or {}).get("legacy_served")
+    classifier = (_read_json(ML_RESULTS_DIR / "comparison" / "severity_classifier.json") or {}).get("test")
+    table = []
+    if legacy:
+        n_deep = sum(old["Deep"].values()) if old else None
+        table.append({"name": "Old pipeline (served verdict)", "n": legacy["n"], "correct": _r(legacy["accuracy"], 3),
+                      "cost": _r(legacy["policy_cost"], 3), "underReported": legacy["under_reported"],
+                      "deepFound": round(legacy["deep_recall"] * n_deep) if n_deep else None, "nDeep": n_deep})
+    if classifier:
+        table.append({"name": "Image classifier (ResNet-18, same labels)", "n": classifier["n"],
+                      "correct": _r(classifier["correct"], 3), "cost": _r(classifier["cost"], 3),
+                      "underReported": classifier["under_reported"], "deepFound": classifier["deep_found"],
+                      "nDeep": classifier["n_deep"]})
+    if meta:
+        y = meta.get("test_yolo", {})
+        table.append({"name": "Depth network (served)", "n": y.get("n"), "correct": _r(y.get("correct"), 3),
+                      "cost": _r(y.get("cost"), 3), "underReported": y.get("under_or_missed"),
+                      "deepFound": y.get("deep_found"), "nDeep": y.get("n_deep")})
+    if table:
+        out["severityTable"] = table
+
+    seg = _read_json(ML_RESULTS_DIR / "yolo_seg_v3_eval.json") or {}
+    rdd = _read_json(ML_RESULTS_DIR / "yolo_seg_rdd_heldout.json") or {}
+    if seg.get("best_v2.pt@0.35") and seg.get("best_v3.pt@0.35"):
+        v2, v3 = seg["best_v2.pt@0.35"], seg["best_v3.pt@0.35"]
+        sets = [("test_kaggle", "Kaggle"), ("test_p600", "Pothole-600"), ("test_pothrgbd", "PothRGBD")]
+        rows = [{"set": label, "foundV2": _r(v2[k]["found@0.5"], 3), "foundV3": _r(v3[k]["found@0.5"], 3),
+                 "falseV2": _r(v2[k]["false_per_img"], 3), "falseV3": _r(v3[k]["false_per_img"], 3)}
+                for k, label in sets if k in v2 and k in v3]
+        a, b = rdd.get("best_v2.pt@0.35"), rdd.get("best_v3.pt@0.35")
+        if a and b:
+            rows.append({"set": "RDD Japan (held-out country)", "foundV2": _r(a["box_recall"], 3),
+                         "foundV3": _r(b["box_recall"], 3), "falseV2": _r(a["neg_frames_hit"], 3),
+                         "falseV3": _r(b["neg_frames_hit"], 3)})
+        out["segmenter"] = rows
+
+    sources = []
+    if meta:
+        sources.append({"dataset": "PothRGBD", "sensor": "RealSense depth camera, Turkey",
+                        "value": _r(meta["test_human"]["mae"], 1), "unit": "mm",
+                        "metric": f"mean error, {meta['test_human']['n']} potholes in held-out sessions"})
+    rsrd = _read_json(ML_RESULTS_DIR / "depth_sources" / "rsrd_test_relief_eval_v8v3.json")
+    if rsrd and rsrd.get("dense_median_mm") is not None:
+        sources.append({"dataset": "RSRD", "sensor": "vehicle stereo + LiDAR, China",
+                        "value": _r(rsrd["dense_median_mm"], 1), "unit": "mm",
+                        "metric": "median per-pixel relief error, held-out drives"})
+    fan = (_read_json(ML_RESULTS_DIR / "depth_sources" / "fan_relief_eval_v8v3.json") or {}).get("rows", {}).get("all|human|relief")
+    if fan:
+        sources.append({"dataset": "Fan stereo sets", "sensor": "stereo camera, never trained on",
+                        "value": _r(fan["mae"], 1), "unit": "mm",
+                        "metric": f"mean error, {fan['n']} potholes; reads deep holes too shallow"})
+    p600 = ((_read_json(ML_RESULTS_DIR / "pothole600" / "relief_shape_eval_served.json") or {})
+            .get("splits", {}).get("testing", {}))
+    if p600.get("relief"):
+        sources.append({"dataset": "Pothole-600", "sensor": "stereo-derived depth picture, no scale",
+                        "value": _r(p600["relief"]["rho_region"]["median"], 2), "unit": "ρ",
+                        "metric": f"shape agreement over pothole and ring (untouched DA-V2: "
+                                  f"{p600['da_v2_untouched']['rho_region']['median']:.2f})"})
+    if sources:
+        out["sources"] = sources
+
+    water = _read_json(ML_RESULTS_DIR / "pothole_water_eval.json")
+    if water:
+        out["water"] = {"n": water["n"], "nWater": water["n_water"],
+                        "segmenter": {k: water["segmenter_crossfit"][k] for k in ("missed_water", "false_alarms")},
+                        "ensemble": {k: water["ensemble"][k] for k in ("missed_water", "false_alarms")}}
+    return out
+
+
 @app.post("/analyze")
-def analyze_image(file: UploadFile = File(...)):
+def analyze_image(file: UploadFile = File(...),
+                  camera_distance_mm: Optional[float] = Form(None),
+                  likelihood: int = Form(DEFAULT_LIKELIHOOD),
+                  route: str = Form("local")):
     # Deliberately NOT `async def`. Every stage below is synchronous CPU/GPU
     # work; inside a coroutine it would block the event loop for the whole scan,
     # stalling every other request — including /healthz — on a single worker.
@@ -858,7 +1096,9 @@ def analyze_image(file: UploadFile = File(...)):
 
     try:
         with _PIPELINE_LOCK:
-            return _run_analysis(tmp_path)
+            site = {"camera_distance_mm": camera_distance_mm if camera_distance_mm and camera_distance_mm > 0 else None,
+                    "likelihood": int(min(5, max(1, likelihood))), "route": route if route in ("county", "local") else "local"}
+            return _run_analysis(tmp_path, site)
     except Exception as e:
         return JSONResponse({"success": False, "error": str(e)}, status_code=500)
     finally:
@@ -866,8 +1106,39 @@ def analyze_image(file: UploadFile = File(...)):
             os.remove(tmp_path)
 
 
-def _run_analysis(tmp_path: str) -> JSONResponse:
+def _hazard_block(metric, geometry, index, mask, pothole, site):
+    """
+    Wheel drop per tyre (with the relief patch the page re-rolls for any width) and the
+    risk-matrix response. Only for potholes the relief network measured.
+    """
+    relief = geometry.get("relief")
+    if relief is None or metric.get("source") != "relief":
+        return None
+    geo_mask = geometry["masks"][index]
+    depth = float(metric["depthMm"])
+    angular = (float(metric["diameterMm"]) / float(metric["cameraDistanceMm"])
+               if metric.get("diameterMm") and metric.get("cameraDistanceMm") else None)
+    water = pothole.get("waterAnalysis") or {}
+    temporal = pothole.get("temporalAnalysis") or {}
+    found = (pothole.get("geometryAnalysis") or {}).get("foundationFeatures") or {}
+    deepest = float(np.max(relief[geo_mask > 0])) if (geo_mask > 0).any() else None
+    feats = hazard.feature_row(depth, deepest, water.get("segmenterCoverage"), temporal.get("edgeSharpness"),
+                               temporal.get("crackTexture"), found.get("varianceRatio"), float((mask > 0).mean()))
+    wheel = hazard.pothole_hazard(relief, geo_mask, depth, angular, site["camera_distance_mm"])
+    wheel["learned"] = hazard.learned_hazard(feats)
+    v = (error_model().get("wheel_drop_validation") or {})
+    if v.get("tyres", {}).get("car"):
+        wheel["validation"] = {"n": v["n"], "car_mae_mm": v["tyres"]["car"]["mae_mm"], "car_r": v["tyres"]["car"]["r"]}
+    car = next(t for t in wheel["tyres"] if t["id"] == "car")
+    width = {"width_mm": wheel["width_mm"]} if wheel["width_mm"] else None
+    risk = compute_risk_matrix(depth, metric.get("inDistribution") is True, width, car["drop_mm"], feats,
+                               site["likelihood"], site["route"], "carriageway", np.random.default_rng(GRADING_SEED))
+    return {"wheel": wheel, "risk": risk}
+
+
+def _run_analysis(tmp_path: str, site: Optional[Dict] = None) -> JSONResponse:
     """The full per-image pipeline. Caller owns the temp file and the lock."""
+    site = site or {"camera_distance_mm": None, "likelihood": DEFAULT_LIKELIHOOD, "route": "local"}
     # ── 1. Read image and segment all potholes ──
     original_image = cv2.imread(tmp_path)
     if original_image is None:
@@ -1157,6 +1428,15 @@ def _run_analysis(tmp_path: str) -> JSONResponse:
         except Exception:
             pass  # graceful degradation
 
+        # Wheel drop by tyre + risk matrix (after water / age / DINOv2: they are its inputs)
+        if _HAS_HAZARD and metric is not None and metric_geometry is not None:
+            try:
+                block = _hazard_block(metric, metric_geometry, idx - 1, mask, pothole, site)
+                if block is not None:
+                    pothole["hazard"] = block
+            except Exception as e:
+                print(f"hazard block failed: {e}")
+
         potholes.append(pothole)
         mask_records.append((mask, pothole))
 
@@ -1277,17 +1557,23 @@ def _run_analysis(tmp_path: str) -> JSONResponse:
 
 @app.get("/insights/summary")
 async def insights_summary():
-    """Return structured model-performance data and graph manifest for the UI."""
-    if not ML_RESULTS_DIR.is_dir():
+    """Return structured model-performance data and graph manifest for the UI.
+
+    `current` holds the depth model's results against measured depth; the top-level
+    keys are the legacy classifier vote, scored against its own pseudo-labels.
+    """
+    current = _current_model_insights()
+    if not ML_RESULTS_DIR.is_dir() and not current:
         return JSONResponse(
             {
                 "success": False,
-                "error": "ml_results directory not found",
+                "error": "neither ml_results/ nor ml_models/metric/relief_meta.json was found",
                 "metrics": [],
                 "ablation": [],
                 "featureColumns": [],
                 "featureRows": [],
                 "graphs": [],
+                "current": {},
             },
             status_code=404,
         )
@@ -1315,8 +1601,20 @@ async def insights_summary():
             "featureRows": feature_data["rows"],
             "graphs": graphs,
             "totalGraphs": len(graphs),
+            "current": current,
         }
     )
+
+
+@app.get("/insights/figures/{file_name}")
+async def insights_figure(file_name: str):
+    """Serve a counterexample figure (old approach vs measured depth)."""
+    if not re.fullmatch(r"[\w.-]+\.png", file_name or ""):
+        raise HTTPException(status_code=400, detail="Invalid file name")
+    target = COUNTEREXAMPLE_DIR / file_name
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path=str(target), filename=target.name)
 
 
 @app.get("/insights/files/{file_name}")
